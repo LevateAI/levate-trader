@@ -10,9 +10,10 @@ import structlog
 
 from src.alerts.discord_notifier import DiscordNotifier
 from src.alerts.twilio_notifier import TwilioNotifier
+from src.config import Settings
 from src.db.supabase_client import SupabaseRepository
 from src.exchange.hyperliquid_client import HyperliquidClient
-from src.models import OrderType, Position, Side, Signal, Trade, TradeStatus
+from src.models import MarketState, OrderType, Position, Side, Signal, Trade, TradeStatus
 from src.risk.circuit_breakers import CircuitBreakerManager
 from src.risk.position_sizer import calculate_position_size
 
@@ -29,12 +30,14 @@ class Executor:
         circuit_breakers: CircuitBreakerManager,
         discord: DiscordNotifier,
         sms: TwilioNotifier | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._exchange = exchange
         self._repository = repository
         self._circuit_breakers = circuit_breakers
         self._discord = discord
         self._sms = sms
+        self._execution_mode = settings.execution_mode if settings else "testnet_real"
         self._open_trades: dict[str, Trade] = {}
 
     async def execute_signal(
@@ -103,6 +106,19 @@ class Executor:
         )
         return response
 
+    async def update_market_state(self, market_state: MarketState) -> None:
+        """No-op hook for interface parity with PaperExecutor."""
+        logger.debug("real_executor_market_state_ignored", symbol=market_state.symbol)
+
+    async def get_open_positions(self) -> list[Position]:
+        """Return real open positions from Hyperliquid."""
+        return await self._exchange.get_open_positions()
+
+    async def close_all_positions(self, reason_exit: str = "risk close") -> list[dict[str, Any]]:
+        """Close all real positions through Hyperliquid."""
+        logger.warning("real_executor_close_all_positions", reason_exit=reason_exit)
+        return await self._exchange.close_all_positions()
+
     async def on_fill(self, signal: Signal, fill: dict[str, Any]) -> Trade:
         """Persist a newly opened trade and position after an entry fill."""
         size = float(fill.get("sz") or fill.get("size") or 0)
@@ -129,7 +145,9 @@ class Executor:
         self._open_trades[str(trade.id)] = trade
 
         trade_payload = _trade_payload(trade)
+        trade_payload["execution_mode"] = self._execution_mode
         position_payload = position.model_dump(mode="json")
+        position_payload["execution_mode"] = self._execution_mode
         if self._repository is not None:
             await self._repository.insert("trades", trade_payload)
             await self._repository.insert("positions", position_payload)
@@ -177,6 +195,7 @@ class Executor:
         trade.status = TradeStatus.CLOSED
 
         payload = _trade_payload(trade)
+        payload["execution_mode"] = self._execution_mode
         if self._repository is not None:
             await self._repository.update("trades", str(trade.id), payload)
             await self._repository.delete("positions", str(trade.id))

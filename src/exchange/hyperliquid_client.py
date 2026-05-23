@@ -7,12 +7,13 @@ from collections.abc import Callable
 from typing import Any
 
 import eth_account
+from eth_account.signers.local import LocalAccount
 import structlog
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-from src.config import Settings
+from src.config import MAINNET_REAL_DISABLED_MESSAGE, Settings
 from src.models import OrderType, Position, Side
 
 logger = structlog.get_logger(__name__)
@@ -22,30 +23,32 @@ COIN_TO_SYMBOL = {value: key for key, value in SYMBOL_TO_COIN.items()}
 
 
 class HyperliquidClient:
-    """Async facade for Hyperliquid testnet trading and market data."""
+    """Async facade for Hyperliquid market data and real testnet trading."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._base_url = (
-            constants.TESTNET_API_URL
-            if settings.hyperliquid_testnet
-            else constants.MAINNET_API_URL
+        self._base_url = self._resolve_base_url(settings)
+        self._wallet: LocalAccount | None = (
+            eth_account.Account.from_key(settings.hyperliquid_private_key)
+            if settings.hyperliquid_private_key
+            else None
         )
-        if not settings.hyperliquid_testnet:
-            raise ValueError("This bot is paper-trading only and refuses mainnet endpoints")
-
-        self._wallet = eth_account.Account.from_key(settings.hyperliquid_private_key)
         self._info: Info | None = None
         self._exchange: Exchange | None = None
         self._subscriptions: list[tuple[dict[str, Any], Callable[[Any], None]]] = []
         self.market_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=10_000)
 
     async def connect_ws(self) -> None:
-        """Create SDK clients with websocket support and configure account leverage."""
-        logger.info("hyperliquid_connecting", base_url=self._base_url)
+        """Create SDK clients with websocket support."""
+        logger.info(
+            "hyperliquid_connecting",
+            base_url=self._base_url,
+            execution_mode=self._settings.execution_mode,
+        )
         await asyncio.to_thread(self._connect_sync)
-        for coin in SYMBOL_TO_COIN.values():
-            await asyncio.to_thread(self._exchange_required().update_leverage, 10, coin, True)
+        if self._settings.execution_mode == "testnet_real":
+            for coin in SYMBOL_TO_COIN.values():
+                await asyncio.to_thread(self._exchange_required().update_leverage, 10, coin, True)
         logger.info("hyperliquid_connected")
 
     async def reconnect_with_backoff(self) -> None:
@@ -84,18 +87,33 @@ class HyperliquidClient:
 
     async def subscribe_to_user_fills(self) -> None:
         """Subscribe to user fill events."""
+        if not self._settings.hyperliquid_account_address:
+            logger.info(
+                "hyperliquid_user_fills_skipped",
+                reason="account_address_not_configured",
+                execution_mode=self._settings.execution_mode,
+            )
+            return
         subscription = {"type": "userFills", "user": self._settings.hyperliquid_account_address}
         callback = self._queue_callback("user_fills", None)
         self._subscriptions.append((subscription, callback))
         await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
         logger.info("hyperliquid_subscribed_user_fills")
 
-    async def get_account_state(self) -> dict[str, Any]:
+    async def get_account_state(self, address: str | None = None) -> dict[str, Any]:
         """Fetch account clearinghouse state."""
-        logger.info("hyperliquid_get_account_state")
+        target_address = address or self._settings.hyperliquid_account_address
+        if not target_address:
+            logger.info(
+                "hyperliquid_account_state_skipped",
+                reason="account_address_not_configured",
+                execution_mode=self._settings.execution_mode,
+            )
+            return {"assetPositions": [], "marginSummary": {}, "withdrawable": "0"}
+        logger.info("hyperliquid_get_account_state", address=target_address)
         return await asyncio.to_thread(
             self._info_required().user_state,
-            self._settings.hyperliquid_account_address,
+            target_address,
         )
 
     async def get_open_positions(self) -> list[Position]:
@@ -219,6 +237,11 @@ class HyperliquidClient:
 
     def _connect_sync(self) -> None:
         self._info = Info(self._base_url, skip_ws=False)
+        if self._settings.execution_mode != "testnet_real":
+            self._exchange = None
+            return
+        if self._wallet is None or self._settings.hyperliquid_account_address is None:
+            raise RuntimeError("testnet_real mode requires Hyperliquid credentials")
         self._exchange = Exchange(
             self._wallet,
             self._base_url,
@@ -251,7 +274,7 @@ class HyperliquidClient:
 
     def _exchange_required(self) -> Exchange:
         if self._exchange is None:
-            raise RuntimeError("Hyperliquid exchange client is not connected")
+            raise RuntimeError("Hyperliquid exchange client is not available in read-only mode")
         return self._exchange
 
     @staticmethod
@@ -259,6 +282,14 @@ class HyperliquidClient:
         if symbol not in SYMBOL_TO_COIN:
             raise ValueError(f"unsupported symbol: {symbol}")
         return SYMBOL_TO_COIN[symbol]
+
+    @staticmethod
+    def _resolve_base_url(settings: Settings) -> str:
+        if settings.execution_mode == "paper_sim":
+            return constants.MAINNET_API_URL
+        if settings.execution_mode == "testnet_real":
+            return constants.TESTNET_API_URL
+        raise ValueError(MAINNET_REAL_DISABLED_MESSAGE)
 
 
 def _maybe_float(value: Any) -> float | None:

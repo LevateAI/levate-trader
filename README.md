@@ -1,8 +1,9 @@
 # Levate Trader
 
-Async-first cryptocurrency paper-trading bot for Hyperliquid testnet. V1 trades
-only `BTC-PERP` and `ETH-PERP`, uses Hyperliquid testnet only, persists activity
-to Supabase, and sends Discord/Twilio alerts.
+Async-first cryptocurrency paper-trading bot for Hyperliquid. V1 trades only
+`BTC-PERP` and `ETH-PERP`, defaults to local paper simulation on Hyperliquid
+mainnet public market data, persists activity to Supabase, and sends
+Discord/Twilio alerts.
 
 This is paper trading infrastructure, not financial advice. Do not point this at
 real-money endpoints.
@@ -25,12 +26,18 @@ python -m src.main
 
 ## Environment Variables
 
-`HYPERLIQUID_PRIVATE_KEY`: API wallet private key.
+`EXECUTION_MODE`: one of `paper_sim`, `testnet_real`, or `mainnet_real`.
+Defaults to `paper_sim`.
+
+`HYPERLIQUID_PRIVATE_KEY`: API wallet private key. Optional in `paper_sim`;
+required in `testnet_real`.
 
 `HYPERLIQUID_ACCOUNT_ADDRESS`: main account address. Hyperliquid info requests
-must use the main wallet address even when trading with an API wallet.
+must use the main wallet address even when trading with an API wallet. Optional
+in `paper_sim`; required in `testnet_real`.
 
-`HYPERLIQUID_TESTNET`: must stay `true`; mainnet is refused at startup.
+`HYPERLIQUID_TESTNET`: legacy setting kept for compatibility. `EXECUTION_MODE`
+controls runtime behavior.
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`: Supabase project URL and service role
 key.
@@ -50,13 +57,33 @@ thresholds as whole percentages. Defaults are `5`, `10`, and `20`.
 
 `STARTING_BALANCE_USD`: used for PnL snapshots before full history is available.
 
+`PAPER_SLIPPAGE_BPS`: simulated slippage in basis points. Defaults to `5`.
+
+`PAPER_MAX_PENDING_ORDERS`: max pending paper limit orders. Defaults to `10`.
+
 `CLOSE_POSITIONS_ON_SHUTDOWN`: reserved safety toggle for future shutdown
 behavior.
 
+## Execution Modes
+
+`paper_sim` is the default. It connects to Hyperliquid mainnet public market
+data in read-only mode, does not require Hyperliquid credentials, and simulates
+all fills, fees, stops, take profits, balances, and PnL locally.
+
+`testnet_real` preserves the original behavior: it connects to Hyperliquid
+testnet, requires `HYPERLIQUID_PRIVATE_KEY` and
+`HYPERLIQUID_ACCOUNT_ADDRESS`, and places real orders on testnet only.
+
+`mainnet_real` is intentionally disabled in v1. Startup fails with:
+`MAINNET REAL MONEY EXECUTION IS DISABLED. Set EXECUTION_MODE=paper_sim or testnet_real.`
+
 ## Database
 
-Run the SQL migration in `supabase/migrations/001_initial_schema.sql` against
-your Supabase project before starting the bot.
+Run the SQL migrations in order against your Supabase project before starting
+the bot:
+
+1. `supabase/migrations/001_initial_schema.sql`
+2. `supabase/migrations/002_add_execution_mode.sql`
 
 ## Funding Hyperliquid Testnet
 
@@ -65,7 +92,7 @@ your Supabase project before starting the bot.
 3. Deposit or faucet testnet USDC into the account.
 4. Put the API private key and main account address in `.env`.
 
-The bot refuses mainnet, but still guard your private keys like real keys.
+`testnet_real` refuses mainnet, but still guard your private keys like real keys.
 
 ## Strategies
 

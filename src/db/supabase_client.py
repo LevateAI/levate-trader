@@ -67,16 +67,24 @@ class SupabaseRepository:
         since_iso: str,
         order_column: str = "timestamp",
         limit: int = 1,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Return the earliest rows at or after a timestamp."""
         logger.info("supabase_select_since", table=table, since_iso=since_iso, limit=limit)
+        filters = filters or {}
+
+        def _select_sync() -> Any:
+            query = (
+                self._client.table(table)
+                .select("*")
+                .gte(order_column, since_iso)
+            )
+            for column, value in filters.items():
+                query = query.eq(column, value)
+            return query.order(order_column, desc=False).limit(limit).execute()
+
         response = await asyncio.to_thread(
-            lambda: self._client.table(table)
-            .select("*")
-            .gte(order_column, since_iso)
-            .order(order_column, desc=False)
-            .limit(limit)
-            .execute()
+            _select_sync
         )
         return list(response.data or [])
 

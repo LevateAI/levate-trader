@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import AnyUrl, Field, field_validator
+from pydantic import AnyUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+ExecutionMode = Literal["paper_sim", "testnet_real", "mainnet_real"]
+MAINNET_REAL_DISABLED_MESSAGE = (
+    "MAINNET REAL MONEY EXECUTION IS DISABLED. "
+    "Set EXECUTION_MODE=paper_sim or testnet_real."
+)
 
 
 class Settings(BaseSettings):
@@ -18,8 +25,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    hyperliquid_private_key: str = Field(..., min_length=1)
-    hyperliquid_account_address: str = Field(..., min_length=1)
+    execution_mode: ExecutionMode = "paper_sim"
+    hyperliquid_private_key: str | None = Field(default=None, min_length=1)
+    hyperliquid_account_address: str | None = Field(default=None, min_length=1)
     hyperliquid_testnet: bool = True
 
     supabase_url: AnyUrl
@@ -38,6 +46,8 @@ class Settings(BaseSettings):
 
     strategies_enabled: str = "cme_gap_fill,rsi_mean_reversion"
     starting_balance_usd: float = 1000.0
+    paper_slippage_bps: float = 5.0
+    paper_max_pending_orders: int = 10
     close_positions_on_shutdown: bool = False
     log_level: str = "INFO"
 
@@ -48,6 +58,43 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("risk percentages must be positive")
         return value
+
+    @field_validator("hyperliquid_private_key", "hyperliquid_account_address", mode="before")
+    @classmethod
+    def empty_credential_to_none(cls, value: str | None) -> str | None:
+        """Treat empty optional credential env vars as unset."""
+        if value == "":
+            return None
+        return value
+
+    @field_validator("paper_slippage_bps")
+    @classmethod
+    def validate_slippage(cls, value: float) -> float:
+        """Validate paper slippage."""
+        if value < 0:
+            raise ValueError("paper slippage cannot be negative")
+        return value
+
+    @field_validator("paper_max_pending_orders")
+    @classmethod
+    def validate_max_pending_orders(cls, value: int) -> int:
+        """Validate pending paper order cap."""
+        if value <= 0:
+            raise ValueError("paper_max_pending_orders must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def validate_execution_mode(self) -> "Settings":
+        """Validate mode-specific credential requirements and safety guards."""
+        if self.execution_mode == "mainnet_real":
+            raise ValueError(MAINNET_REAL_DISABLED_MESSAGE)
+        if self.execution_mode == "testnet_real":
+            if not self.hyperliquid_private_key or not self.hyperliquid_account_address:
+                raise ValueError(
+                    "HYPERLIQUID_PRIVATE_KEY and HYPERLIQUID_ACCOUNT_ADDRESS "
+                    "are required when EXECUTION_MODE=testnet_real"
+                )
+        return self
 
     @property
     def enabled_strategy_names(self) -> list[str]:

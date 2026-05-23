@@ -15,7 +15,7 @@ from src.alerts.twilio_notifier import TwilioNotifier
 from src.config import get_settings
 from src.db.supabase_client import SupabaseRepository
 from src.exchange.hyperliquid_client import HyperliquidClient
-from src.execution.executor import Executor
+from src.execution import get_executor
 from src.logging import configure_logging
 from src.models import BTC_PERP, ETH_PERP, EquitySnapshot, MarketState
 from src.risk.circuit_breakers import CircuitBreakerManager
@@ -30,6 +30,7 @@ class TraderRuntime:
     def __init__(self) -> None:
         self.settings = get_settings()
         configure_logging(self.settings.log_level)
+        self._log_startup_banner()
         self.repository = SupabaseRepository(self.settings)
         self.exchange = HyperliquidClient(self.settings)
         self.discord = DiscordNotifier(self.settings.discord_webhook_url)
@@ -40,12 +41,13 @@ class TraderRuntime:
             self.discord,
             self.sms,
         )
-        self.executor = Executor(
-            self.exchange,
-            self.repository,
-            self.circuit_breakers,
-            self.discord,
-            self.sms,
+        self.executor = get_executor(
+            settings=self.settings,
+            exchange=self.exchange,
+            repository=self.repository,
+            circuit_breakers=self.circuit_breakers,
+            discord=self.discord,
+            sms=self.sms,
         )
         self.stop_event = asyncio.Event()
         self.high_water_equity = self.settings.starting_balance_usd
@@ -88,7 +90,9 @@ class TraderRuntime:
                 symbol = event.get("symbol")
                 if symbol not in {BTC_PERP, ETH_PERP}:
                     continue
-                market_state = await self._build_market_state(symbol)
+                market_state = await self._build_market_state(symbol, event)
+                if self.settings.execution_mode == "paper_sim":
+                    await self.executor.update_market_state(market_state)
                 await self._write_market_snapshot(market_state)
                 for strategy in strategies:
                     if symbol not in strategy.symbols:
@@ -96,7 +100,11 @@ class TraderRuntime:
                     signal_result = await strategy.on_tick(market_state.model_dump())
                     if signal_result is None:
                         continue
-                    equity = market_state.equity_usd or self.settings.starting_balance_usd
+                    equity = (
+                        self.executor.paper_equity_usd
+                        if self.settings.execution_mode == "paper_sim"
+                        else market_state.equity_usd or self.settings.starting_balance_usd
+                    )
                     vol = await self._realized_daily_vol(symbol)
                     await self.executor.execute_signal(signal_result, equity, vol)
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
@@ -111,25 +119,39 @@ class TraderRuntime:
                 await self.repository.insert("equity_snapshots", snapshot.model_dump(mode="json"))
                 breaker_event = await self.circuit_breakers.evaluate(snapshot)
                 if breaker_event and breaker_event.breaker_type in {"weekly_loss", "max_drawdown"}:
-                    await self.exchange.close_all_positions()
+                    if self.settings.execution_mode == "paper_sim":
+                        await self.executor.close_all_positions("paper circuit breaker")
+                    else:
+                        await self.exchange.close_all_positions()
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("snapshot_loop_error", error=str(exc), error_type=type(exc).__name__)
                 self.sms.send_error(exc)
             await asyncio.sleep(60)
 
-    async def _build_market_state(self, symbol: str) -> MarketState:
-        mid = await self.exchange.get_mid_price(symbol)
-        account_state = await self.exchange.get_account_state()
-        equity = float(account_state.get("marginSummary", {}).get("accountValue") or 0)
-        positions = await self.exchange.get_open_positions()
+    async def _build_market_state(self, symbol: str, event: dict[str, Any]) -> MarketState:
+        parsed = _parse_market_event(event)
+        fallback_mid = await self.exchange.get_mid_price(symbol)
+        mid = parsed.get("mid") or parsed.get("last_trade_price") or fallback_mid
+        bid = parsed.get("bid")
+        ask = parsed.get("ask")
+        if bid is None or ask is None:
+            spread = mid * 0.0002
+            bid = mid - spread / 2
+            ask = mid + spread / 2
+        if self.settings.execution_mode == "paper_sim":
+            equity = self.executor.paper_equity_usd
+            positions = await self.executor.get_open_positions()
+        else:
+            account_state = await self.exchange.get_account_state()
+            equity = float(account_state.get("marginSummary", {}).get("accountValue") or 0)
+            positions = await self.exchange.get_open_positions()
         bars = await self._fetch_recent_bars(symbol, count=60)
-        spread = mid * 0.0002
         return MarketState(
             symbol=symbol,
-            bid=mid - spread / 2,
-            ask=mid + spread / 2,
+            bid=float(bid),
+            ask=float(ask),
             mid=mid,
-            last_trade_price=mid,
+            last_trade_price=float(parsed.get("last_trade_price") or mid),
             bars_5m=bars,
             equity_usd=equity,
             open_positions=positions,
@@ -158,6 +180,27 @@ class TraderRuntime:
         await self.repository.insert("market_data_snapshots", payload)
 
     async def _build_equity_snapshot(self) -> EquitySnapshot:
+        if self.settings.execution_mode == "paper_sim":
+            equity = self.executor.paper_equity_usd
+            daily_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=1))
+            weekly_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=7))
+            self.high_water_equity = max(self.high_water_equity, equity)
+            mdd = (
+                (self.high_water_equity - equity) / self.high_water_equity
+                if self.high_water_equity > 0
+                else 0
+            )
+            return EquitySnapshot(
+                execution_mode=self.settings.execution_mode,
+                balance_usd=self.executor.paper_balance_usd,
+                equity_usd=equity,
+                margin_used_usd=self.executor.paper_margin_used_usd,
+                open_position_count=len(self.executor.open_positions),
+                daily_pnl=daily_pnl,
+                weekly_pnl=weekly_pnl,
+                mdd_pct=mdd,
+            )
+
         account_state = await self.exchange.get_account_state()
         margin_summary = account_state.get("marginSummary", {})
         equity = float(margin_summary.get("accountValue") or self.settings.starting_balance_usd)
@@ -173,6 +216,7 @@ class TraderRuntime:
         daily_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=1))
         weekly_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=7))
         return EquitySnapshot(
+            execution_mode=self.settings.execution_mode,
             balance_usd=withdrawable,
             equity_usd=equity,
             margin_used_usd=margin_used,
@@ -187,6 +231,7 @@ class TraderRuntime:
             "equity_snapshots",
             since.isoformat(),
             limit=1,
+            filters={"execution_mode": self.settings.execution_mode},
         )
         if not rows:
             return current_equity - self.settings.starting_balance_usd
@@ -230,6 +275,28 @@ class TraderRuntime:
             close_positions_on_shutdown=self.settings.close_positions_on_shutdown,
         )
 
+    def _log_startup_banner(self) -> None:
+        if self.settings.execution_mode == "paper_sim":
+            market_data = "Hyperliquid MAINNET (read-only)"
+            fills = "Simulated locally"
+            balance = f"${self.settings.starting_balance_usd:.2f} USD (paper)"
+        else:
+            market_data = "Hyperliquid TESTNET"
+            fills = "Real orders on Hyperliquid testnet"
+            balance = "Hyperliquid testnet account"
+        logger.warning(
+            "execution_mode_banner",
+            banner=(
+                "\n=======================================\n"
+                f" EXECUTION MODE: {self.settings.execution_mode.upper()}\n"
+                f" Market data: {market_data}\n"
+                f" Fills: {fills}\n"
+                f" Starting balance: {balance}\n"
+                "======================================="
+            ),
+            execution_mode=self.settings.execution_mode,
+        )
+
 
 async def main() -> None:
     """Async entrypoint."""
@@ -238,6 +305,24 @@ async def main() -> None:
     for signame in ("SIGTERM", "SIGINT"):
         loop.add_signal_handler(getattr(signal, signame), runtime.request_shutdown)
     await runtime.run()
+
+
+def _parse_market_event(event: dict[str, Any]) -> dict[str, float]:
+    payload = event.get("payload") or {}
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, dict) and "levels" in data:
+        levels = data.get("levels") or []
+        if len(levels) >= 2 and levels[0] and levels[1]:
+            bid = float(levels[0][0]["px"])
+            ask = float(levels[1][0]["px"])
+            return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
+    if isinstance(data, list) and data:
+        last = data[-1]
+        if isinstance(last, dict) and "px" in last:
+            return {"last_trade_price": float(last["px"])}
+    if isinstance(data, dict) and "px" in data:
+        return {"last_trade_price": float(data["px"])}
+    return {}
 
 
 if __name__ == "__main__":

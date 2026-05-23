@@ -119,6 +119,7 @@ class EquitySnapshot(BaseModel):
     """Account equity snapshot."""
 
     timestamp: datetime = Field(default_factory=utc_now)
+    execution_mode: str = "paper_sim"
     balance_usd: float
     equity_usd: float
     margin_used_usd: float
