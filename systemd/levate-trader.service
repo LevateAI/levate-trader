@@ -1,0 +1,18 @@
+[Unit]
+Description=Levate Hyperliquid Testnet Paper Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=levatetrader
+WorkingDirectory=/opt/levate-trader
+EnvironmentFile=/opt/levate-trader/.env
+ExecStart=/opt/levate-trader/venv/bin/python -m src.main
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
