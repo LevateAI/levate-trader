@@ -7,22 +7,11 @@ from typing import Any
 
 import structlog
 
+from src.data.cme_data import CmeDataUnavailableError, CmeReferenceFetcher
 from src.models import BTC_PERP, Position, Side, Signal
 from src.strategies.base import Strategy
 
 logger = structlog.get_logger(__name__)
-
-
-class CmeReferenceFetcher:
-    """Placeholder CME reference data fetcher."""
-
-    async def fetch_friday_settlement(self) -> float:
-        """Return Friday BTC futures settlement.
-
-        TODO: Replace this hardcoded placeholder with a real public CME/Coinglass
-        source once the data provider is selected.
-        """
-        return 105_000.00
 
 
 class CmeGapFillStrategy(Strategy):
@@ -50,7 +39,17 @@ class CmeGapFillStrategy(Strategy):
             return None
 
         current_price = float(market_state["mid"])
-        friday_close = await self._reference_fetcher.fetch_friday_settlement()
+        try:
+            friday_close = await self._reference_fetcher.fetch_friday_settlement()
+        except CmeDataUnavailableError as exc:
+            self._last_signal_week = iso_key
+            logger.warning(
+                "cme_data_unavailable",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                symbol=symbol,
+            )
+            return None
         gap = current_price - friday_close
         if abs(gap) <= 200:
             logger.info("cme_gap_no_signal", gap=gap, current_price=current_price)
