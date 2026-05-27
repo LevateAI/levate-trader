@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ class DummyRepository:
     inserts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     updates: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     deletes: list[tuple[str, str]] = field(default_factory=list)
+    rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     async def insert(self, table: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.inserts.setdefault(table, []).append(payload)
@@ -28,6 +30,22 @@ class DummyRepository:
 
     async def delete(self, table: str, row_id: str) -> None:
         self.deletes.append((table, row_id))
+
+    async def select_where(
+        self,
+        table: str,
+        filters: dict[str, Any],
+        limit: int = 1000,
+        order_column: str = "timestamp",
+        desc: bool = True,
+    ) -> list[dict[str, Any]]:
+        rows = [
+            row
+            for row in self.rows.get(table, [])
+            if all(row.get(column) == value for column, value in filters.items())
+        ]
+        rows.sort(key=lambda row: str(row.get(order_column, "")), reverse=desc)
+        return rows[:limit]
 
 
 @dataclass
@@ -277,3 +295,77 @@ async def test_paper_balance_never_goes_negative_or_circuit_breaker_trips() -> N
     assert executor.paper_balance_usd >= 0
     assert event is not None
     assert event.breaker_type == "max_drawdown"
+
+
+@pytest.mark.asyncio
+async def test_paper_restore_state_rehydrates_open_trade_and_position() -> None:
+    trade_id = "11111111-1111-4111-8111-111111111111"
+    timestamp = datetime(2026, 5, 26, 12, 0, tzinfo=UTC).isoformat()
+    repository = DummyRepository(
+        rows={
+            "trades": [
+                {
+                    "id": trade_id,
+                    "timestamp": timestamp,
+                    "strategy_name": "rsi_mean_reversion",
+                    "symbol": BTC_PERP,
+                    "side": "long",
+                    "size": 1,
+                    "entry_price": 100,
+                    "exit_price": None,
+                    "pnl_usd": None,
+                    "pnl_pct": None,
+                    "fees_usd": 0.05,
+                    "hold_duration_sec": None,
+                    "reason_entry": "restored test trade",
+                    "reason_exit": None,
+                    "regime": None,
+                    "status": "open",
+                    "execution_mode": "paper_sim",
+                    "created_at": timestamp,
+                }
+            ],
+            "positions": [
+                {
+                    "id": trade_id,
+                    "timestamp": timestamp,
+                    "symbol": BTC_PERP,
+                    "side": "long",
+                    "size": 1,
+                    "entry_price": 100,
+                    "liquidation_price": None,
+                    "unrealized_pnl": 2.5,
+                    "leverage": 10,
+                    "strategy_name": "rsi_mean_reversion",
+                    "stop_loss": 99,
+                    "take_profit": 105,
+                    "execution_mode": "paper_sim",
+                }
+            ],
+            "equity_snapshots": [
+                {
+                    "timestamp": timestamp,
+                    "balance_usd": 999.95,
+                    "equity_usd": 1002.45,
+                    "execution_mode": "paper_sim",
+                }
+            ],
+        }
+    )
+    executor = _executor(repository=repository)
+
+    await executor.restore_state()
+
+    assert executor.paper_balance_usd == pytest.approx(999.95)
+    assert executor._trade_ids_by_symbol[BTC_PERP] == trade_id
+    assert str(next(iter(executor._open_trades))) == trade_id
+    restored_position = executor.open_positions[BTC_PERP]
+    assert restored_position.strategy_name == "rsi_mean_reversion"
+    assert restored_position.stop_loss == pytest.approx(99)
+    assert restored_position.take_profit == pytest.approx(105)
+    assert restored_position.current_unrealized_pnl == pytest.approx(2.5)
+
+    await executor.update_market_state(_market(bid=98.5, ask=98.7, last=98.5))
+
+    assert BTC_PERP not in executor.open_positions
+    assert repository.updates["trades"][-1]["status"] == "closed"

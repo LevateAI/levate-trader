@@ -99,6 +99,84 @@ class PaperExecutor:
             )
         )
 
+    async def restore_state(self) -> None:
+        """Restore open paper trades and positions from Supabase after restart."""
+        if self._repository is None:
+            logger.info("paper_restore_skipped", reason="repository_not_configured")
+            return
+
+        open_trade_rows = await self._repository.select_where(
+            "trades",
+            filters={
+                "status": TradeStatus.OPEN.value,
+                "execution_mode": self._settings.execution_mode,
+            },
+            limit=1000,
+            order_column="timestamp",
+            desc=False,
+        )
+        latest_snapshot_rows = await self._repository.select_where(
+            "equity_snapshots",
+            filters={"execution_mode": self._settings.execution_mode},
+            limit=1,
+            order_column="timestamp",
+            desc=True,
+        )
+
+        restored_count = 0
+        restored_entry_fees = 0.0
+        for trade_row in open_trade_rows:
+            trade = self._trade_from_row(trade_row)
+            position_rows = await self._repository.select_where(
+                "positions",
+                filters={
+                    "id": str(trade.id),
+                    "execution_mode": self._settings.execution_mode,
+                },
+                limit=1,
+                order_column="timestamp",
+                desc=True,
+            )
+            if not position_rows:
+                logger.error(
+                    "paper_restore_position_missing",
+                    trade_id=str(trade.id),
+                    symbol=trade.symbol,
+                )
+                continue
+
+            paper_position = self._paper_position_from_rows(trade, position_rows[0])
+            if paper_position.symbol in self.open_positions:
+                logger.error(
+                    "paper_restore_duplicate_symbol_skipped",
+                    trade_id=str(trade.id),
+                    symbol=paper_position.symbol,
+                )
+                continue
+
+            self.open_positions[paper_position.symbol] = paper_position
+            self._open_trades[str(trade.id)] = trade
+            self._trade_ids_by_symbol[paper_position.symbol] = str(trade.id)
+            self._last_position_row_update[paper_position.symbol] = datetime.now(tz=UTC)
+            restored_entry_fees += paper_position.fees_paid
+            restored_count += 1
+
+        if latest_snapshot_rows:
+            self.paper_balance_usd = _money(float(latest_snapshot_rows[0]["balance_usd"]))
+        else:
+            self.paper_balance_usd = max(
+                0.0,
+                _money(self._settings.starting_balance_usd - restored_entry_fees),
+            )
+
+        logger.info(
+            "paper_state_restored",
+            restored_count=restored_count,
+            open_trade_count=len(open_trade_rows),
+            paper_balance_usd=self.paper_balance_usd,
+            execution_mode=self._settings.execution_mode,
+        )
+
     async def execute_signal(
         self,
         signal: Signal,
@@ -528,6 +606,35 @@ class PaperExecutor:
             "execution_mode": self._settings.execution_mode,
         }
 
+    def _trade_from_row(self, trade_row: dict[str, Any]) -> Trade:
+        payload = dict(trade_row)
+        payload.pop("created_at", None)
+        payload.pop("execution_mode", None)
+        payload["reason_entry"] = payload.get("reason_entry") or "restored paper trade"
+        payload["fees_usd"] = float(payload.get("fees_usd") or 0)
+        return Trade(**payload)
+
+    def _paper_position_from_rows(
+        self,
+        trade: Trade,
+        position_row: dict[str, Any],
+    ) -> PaperPosition:
+        side = _position_side(position_row.get("side") or trade.side)
+        entry_time = _coerce_datetime(position_row.get("timestamp") or trade.timestamp)
+        return PaperPosition(
+            symbol=str(position_row.get("symbol") or trade.symbol),
+            side=side,
+            size=float(position_row.get("size") or trade.size),
+            entry_price=_money(float(position_row.get("entry_price") or trade.entry_price)),
+            entry_time=entry_time,
+            leverage=float(position_row.get("leverage") or 1),
+            stop_loss=_maybe_float(position_row.get("stop_loss")),
+            take_profit=_maybe_float(position_row.get("take_profit")),
+            strategy_name=str(position_row.get("strategy_name") or trade.strategy_name),
+            fees_paid=_money(float(trade.fees_usd or 0)),
+            current_unrealized_pnl=_money(float(position_row.get("unrealized_pnl") or 0)),
+        )
+
 
 def _money(value: float) -> float:
     return round(float(value), 2)
@@ -536,3 +643,27 @@ def _money(value: float) -> float:
 def _gross_pnl(side: Side, entry_price: float, exit_price: float, size: float) -> float:
     direction = 1 if side == Side.LONG else -1
     return (exit_price - entry_price) * size * direction
+
+
+def _coerce_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return datetime.now(tz=UTC)
+
+
+def _maybe_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _position_side(value: Any) -> Side:
+    side = value if isinstance(value, Side) else Side(str(value))
+    if side == Side.BUY:
+        return Side.LONG
+    if side == Side.SELL:
+        return Side.SHORT
+    return side

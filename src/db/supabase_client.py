@@ -61,6 +61,26 @@ class SupabaseRepository:
         )
         return list(response.data or [])
 
+    async def select_where(
+        self,
+        table: str,
+        filters: dict[str, Any],
+        limit: int = 1000,
+        order_column: str = "timestamp",
+        desc: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return rows matching exact filters."""
+        logger.info("supabase_select_where", table=table, filters=list(filters), limit=limit)
+
+        def _select_sync() -> Any:
+            query = self._client.table(table).select("*")
+            for column, value in filters.items():
+                query = query.eq(column, value)
+            return query.order(order_column, desc=desc).limit(limit).execute()
+
+        response = await asyncio.to_thread(_select_sync)
+        return list(response.data or [])
+
     async def select_since(
         self,
         table: str,

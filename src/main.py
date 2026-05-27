@@ -61,6 +61,8 @@ class TraderRuntime:
         logger.info("runtime_starting")
         await self.sms.start()
         await self.circuit_breakers.load_state()
+        if self.settings.execution_mode == "paper_sim":
+            await self.executor.restore_state()
         await self.exchange.connect_ws()
         strategies = self._load_strategies()
         symbols = sorted({symbol for strategy in strategies for symbol in strategy.symbols})
