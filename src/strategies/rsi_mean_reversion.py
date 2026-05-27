@@ -36,8 +36,8 @@ class RsiMeanReversionStrategy(Strategy):
         bid = float(market_state["bid"])
         ask = float(market_state["ask"])
 
-        long_position = _has_position(open_positions, symbol, Side.LONG)
-        short_position = _has_position(open_positions, symbol, Side.SHORT)
+        long_position = _has_position(open_positions, symbol, Side.LONG, strategy_name=self.name)
+        short_position = _has_position(open_positions, symbol, Side.SHORT, strategy_name=self.name)
         if long_position and current_rsi > 50:
             return Signal(
                 side=Side.SHORT,
@@ -133,12 +133,25 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     return rsi.fillna(50)
 
 
-def _has_position(positions: list[Any], symbol: str, side: Side) -> bool:
+def _has_position(
+    positions: list[Any],
+    symbol: str,
+    side: Side,
+    strategy_name: str | None = None,
+) -> bool:
     for position in positions:
         if isinstance(position, Position):
-            if position.symbol == symbol and position.side == side:
+            if (
+                position.symbol == symbol
+                and position.side == side
+                and (strategy_name is None or position.strategy_name == strategy_name)
+            ):
                 return True
             continue
-        if position.get("symbol") == symbol and position.get("side") == side.value:
+        if (
+            position.get("symbol") == symbol
+            and position.get("side") == side.value
+            and (strategy_name is None or position.get("strategy_name") == strategy_name)
+        ):
             return True
     return False

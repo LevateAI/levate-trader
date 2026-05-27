@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.models import BTC_PERP, ETH_PERP, Side
+from src.models import BTC_PERP, ETH_PERP, Position, Side
 from src.strategies.cme_gap_fill import CmeGapFillStrategy
 from src.strategies.rsi_mean_reversion import RsiMeanReversionStrategy
 
@@ -72,3 +72,29 @@ async def test_rsi_strategy_fires_short_on_overbought() -> None:
     assert signal is not None
     assert signal.side == Side.SHORT
     assert signal.stop_loss == pytest.approx(109.1 * 1.008)
+
+
+@pytest.mark.asyncio
+async def test_rsi_strategy_does_not_close_other_strategy_position() -> None:
+    strategy = RsiMeanReversionStrategy()
+    closes = [100, 99, 98, 99, 100, 101, 100, 99, 100, 101]
+    bars = [{"c": close} for close in closes]
+    cme_position = Position(
+        symbol=BTC_PERP,
+        side=Side.LONG,
+        size=1,
+        entry_price=100,
+        strategy_name="cme_gap_fill",
+    )
+
+    signal = await strategy.on_tick(
+        {
+            "symbol": BTC_PERP,
+            "bars_5m": bars,
+            "bid": 100.9,
+            "ask": 101.1,
+            "open_positions": [cme_position],
+        }
+    )
+
+    assert signal is None or not signal.reduce_only

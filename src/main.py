@@ -51,6 +51,10 @@ class TraderRuntime:
         )
         self.stop_event = asyncio.Event()
         self.high_water_equity = self.settings.starting_balance_usd
+        self._bars_5m: dict[str, list[dict[str, Any]]] = {}
+        self._bars_last_fetch: dict[str, datetime] = {}
+        self._last_market_state: dict[str, MarketState] = {}
+        self._http_calls_this_minute = 0
 
     async def run(self) -> None:
         """Run until a shutdown signal is received."""
@@ -68,6 +72,7 @@ class TraderRuntime:
         tasks = [
             asyncio.create_task(self._market_loop(strategies), name="market-loop"),
             asyncio.create_task(self._snapshot_loop(), name="snapshot-loop"),
+            asyncio.create_task(self.exchange.watchdog_loop(), name="hyperliquid-ws-watchdog"),
         ]
         await self.stop_event.wait()
         logger.info("runtime_shutdown_started")
@@ -126,14 +131,20 @@ class TraderRuntime:
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("snapshot_loop_error", error=str(exc), error_type=type(exc).__name__)
                 self.sms.send_error(exc)
+            self._log_http_calls_per_minute()
             await asyncio.sleep(60)
 
     async def _build_market_state(self, symbol: str, event: dict[str, Any]) -> MarketState:
         parsed = _parse_market_event(event)
-        fallback_mid = await self.exchange.get_mid_price(symbol)
-        mid = parsed.get("mid") or parsed.get("last_trade_price") or fallback_mid
-        bid = parsed.get("bid")
-        ask = parsed.get("ask")
+        previous = self._last_market_state.get(symbol)
+        mid = parsed.get("mid") or parsed.get("last_trade_price")
+        if mid is None and previous is not None:
+            mid = previous.mid
+        if mid is None:
+            raise ValueError(f"market event missing price and no cached market state for {symbol}")
+
+        bid = parsed.get("bid") or (previous.bid if previous is not None else None)
+        ask = parsed.get("ask") or (previous.ask if previous is not None else None)
         if bid is None or ask is None:
             spread = mid * 0.0002
             bid = mid - spread / 2
@@ -142,20 +153,23 @@ class TraderRuntime:
             equity = self.executor.paper_equity_usd
             positions = await self.executor.get_open_positions()
         else:
+            self._record_http_call(2)
             account_state = await self.exchange.get_account_state()
             equity = float(account_state.get("marginSummary", {}).get("accountValue") or 0)
             positions = await self.exchange.get_open_positions()
-        bars = await self._fetch_recent_bars(symbol, count=60)
-        return MarketState(
+        bars = await self._get_bars_5m(symbol, count=60)
+        market_state = MarketState(
             symbol=symbol,
             bid=float(bid),
             ask=float(ask),
-            mid=mid,
+            mid=float(mid),
             last_trade_price=float(parsed.get("last_trade_price") or mid),
             bars_5m=bars,
             equity_usd=equity,
             open_positions=positions,
         )
+        self._last_market_state[symbol] = market_state
+        return market_state
 
     async def _write_market_snapshot(self, market_state: MarketState) -> None:
         payload = {
@@ -202,6 +216,7 @@ class TraderRuntime:
             )
 
         account_state = await self.exchange.get_account_state()
+        self._record_http_call(2)
         margin_summary = account_state.get("marginSummary", {})
         equity = float(margin_summary.get("accountValue") or self.settings.starting_balance_usd)
         margin_used = float(margin_summary.get("totalMarginUsed") or 0)
@@ -239,14 +254,41 @@ class TraderRuntime:
         return current_equity - start_equity
 
     async def _fetch_recent_bars(self, symbol: str, count: int) -> list[dict[str, Any]]:
+        if self._bars_cache_is_fresh(symbol):
+            return self._bars_5m[symbol]
+
         end = datetime.now(tz=UTC)
         start = end - timedelta(minutes=5 * count)
-        return await self.exchange.get_candles(
+        self._record_http_call()
+        bars = await self.exchange.get_candles(
             symbol=symbol,
             interval="5m",
             start_ms=int(start.timestamp() * 1000),
             end_ms=int(end.timestamp() * 1000),
         )
+        self._bars_5m[symbol] = bars
+        self._bars_last_fetch[symbol] = end
+        return bars
+
+    async def _get_bars_5m(self, symbol: str, count: int) -> list[dict[str, Any]]:
+        if self._bars_cache_is_fresh(symbol):
+            return self._bars_5m[symbol]
+        return await self._fetch_recent_bars(symbol, count)
+
+    def _bars_cache_is_fresh(self, symbol: str) -> bool:
+        last_fetch = self._bars_last_fetch.get(symbol)
+        return (
+            symbol in self._bars_5m
+            and last_fetch is not None
+            and (datetime.now(tz=UTC) - last_fetch).total_seconds() < 60
+        )
+
+    def _record_http_call(self, count: int = 1) -> None:
+        self._http_calls_this_minute += count
+
+    def _log_http_calls_per_minute(self) -> None:
+        logger.info("http_calls_per_minute", count=self._http_calls_this_minute)
+        self._http_calls_this_minute = 0
 
     async def _realized_daily_vol(self, symbol: str) -> float:
         bars = await self._fetch_recent_bars(symbol, count=288)

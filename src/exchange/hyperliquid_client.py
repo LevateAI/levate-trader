@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import eth_account
@@ -37,6 +38,7 @@ class HyperliquidClient:
         self._exchange: Exchange | None = None
         self._subscriptions: list[tuple[dict[str, Any], Callable[[Any], None]]] = []
         self.market_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=10_000)
+        self._last_event_at = datetime.now(tz=UTC)
 
     async def connect_ws(self) -> None:
         """Create SDK clients with websocket support."""
@@ -66,6 +68,26 @@ class HyperliquidClient:
                 logger.error("hyperliquid_reconnect_failed", error=str(exc), delay=delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
+
+    async def watchdog_loop(
+        self,
+        stale_threshold_sec: int = 30,
+        check_interval_sec: int = 10,
+    ) -> None:
+        """Reconnect when no websocket events have arrived recently."""
+        while True:
+            await asyncio.sleep(check_interval_sec)
+            now = datetime.now(tz=UTC)
+            last_event_age_sec = (now - self._last_event_at).total_seconds()
+            if last_event_age_sec <= stale_threshold_sec:
+                continue
+            logger.warning(
+                "websocket_stale_detected",
+                last_event_age_sec=round(last_event_age_sec, 2),
+                stale_threshold_sec=stale_threshold_sec,
+            )
+            await self.reconnect_with_backoff()
+            self._last_event_at = datetime.now(tz=UTC)
 
     async def subscribe_to_book(self, symbol: str) -> None:
         """Subscribe to L2 book updates."""
@@ -258,6 +280,7 @@ class HyperliquidClient:
         return callback
 
     def _safe_queue_event(self, event: dict[str, Any]) -> None:
+        self._last_event_at = datetime.now(tz=UTC)
         try:
             self.market_events.put_nowait(event)
         except asyncio.QueueFull:
