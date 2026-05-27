@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     starting_balance_usd: float = 1000.0
     paper_slippage_bps: float = 5.0
     paper_max_pending_orders: int = 10
+    scalp_mode_enabled: bool = True
+    scalp_max_hold_minutes: int = 15
+    scalp_cooldown_seconds: int = 600
     close_positions_on_shutdown: bool = False
     log_level: str = "INFO"
 
@@ -57,6 +60,14 @@ class Settings(BaseSettings):
         """Validate that configured risk percentages are positive."""
         if value <= 0:
             raise ValueError("risk percentages must be positive")
+        return value
+
+    @field_validator("scalp_max_hold_minutes", "scalp_cooldown_seconds")
+    @classmethod
+    def validate_scalp_positive_ints(cls, value: int) -> int:
+        """Validate positive scalp runtime limits."""
+        if value <= 0:
+            raise ValueError("scalp runtime limits must be positive")
         return value
 
     @field_validator("hyperliquid_private_key", "hyperliquid_account_address", mode="before")

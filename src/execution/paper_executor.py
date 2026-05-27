@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -17,6 +17,7 @@ from src.exchange.hyperliquid_client import HyperliquidClient
 from src.models import MarketState, OrderType, Position, Side, Signal, Trade, TradeStatus
 from src.risk.circuit_breakers import CircuitBreakerManager
 from src.risk.position_sizer import calculate_position_size
+from src.strategies.scalp_common import is_scalp_strategy_name
 
 logger = structlog.get_logger(__name__)
 
@@ -39,6 +40,7 @@ class PaperPosition:
     strategy_name: str
     fees_paid: float
     current_unrealized_pnl: float
+    max_hold_minutes: int | None = None
 
 
 @dataclass(slots=True)
@@ -281,7 +283,11 @@ class PaperExecutor:
         """Update latest market state and evaluate paper orders/positions."""
         self._latest_market[market_state.symbol] = market_state
         await self._check_pending_orders(market_state.symbol, market_state)
-        await self._check_position_exit(market_state.symbol, market_state.last_trade_price)
+        await self._check_position_exit(
+            market_state.symbol,
+            market_state.last_trade_price,
+            market_state.timestamp,
+        )
         self._update_unrealized(market_state.symbol, market_state.last_trade_price)
         await self._maybe_update_position_row(market_state.symbol)
 
@@ -441,6 +447,11 @@ class PaperExecutor:
             fees_usd=fee,
             reason_entry=signal.reasoning if signal else "manual paper simulated order",
         )
+        max_hold_minutes = (
+            self._settings.scalp_max_hold_minutes
+            if signal is not None and is_scalp_strategy_name(signal.strategy_name)
+            else None
+        )
         paper_position = PaperPosition(
             symbol=symbol,
             side=position_side,
@@ -453,6 +464,7 @@ class PaperExecutor:
             strategy_name=trade.strategy_name,
             fees_paid=fee,
             current_unrealized_pnl=0.0,
+            max_hold_minutes=max_hold_minutes,
         )
         self.open_positions[symbol] = paper_position
         self._trade_ids_by_symbol[symbol] = str(trade.id)
@@ -513,7 +525,12 @@ class PaperExecutor:
         )
         logger.info("paper_limit_order_filled", oid=order.oid, trade_id=str(trade.id))
 
-    async def _check_position_exit(self, symbol: str, price: float) -> None:
+    async def _check_position_exit(
+        self,
+        symbol: str,
+        price: float,
+        now: datetime | None = None,
+    ) -> None:
         position = self.open_positions.get(symbol)
         if position is None:
             return
@@ -530,6 +547,13 @@ class PaperExecutor:
                 return
             if position.take_profit is not None and price <= position.take_profit:
                 await self.close_position(symbol, position.take_profit, "paper take profit triggered")
+                return
+        if position.max_hold_minutes is None:
+            return
+        current_time = now or datetime.now(tz=UTC)
+        max_hold = timedelta(minutes=position.max_hold_minutes)
+        if position.entry_time + max_hold <= current_time:
+            await self.close_position(symbol, price, "scalp max hold time reached")
 
     def _update_unrealized(self, symbol: str, price: float) -> None:
         position = self.open_positions.get(symbol)
@@ -633,7 +657,18 @@ class PaperExecutor:
             strategy_name=str(position_row.get("strategy_name") or trade.strategy_name),
             fees_paid=_money(float(trade.fees_usd or 0)),
             current_unrealized_pnl=_money(float(position_row.get("unrealized_pnl") or 0)),
+            max_hold_minutes=self._restored_max_hold_minutes(position_row, trade),
         )
+
+    def _restored_max_hold_minutes(
+        self,
+        position_row: dict[str, Any],
+        trade: Trade,
+    ) -> int | None:
+        strategy_name = str(position_row.get("strategy_name") or trade.strategy_name)
+        if not is_scalp_strategy_name(strategy_name):
+            return None
+        return self._settings.scalp_max_hold_minutes
 
 
 def _money(value: float) -> float:

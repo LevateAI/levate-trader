@@ -52,14 +52,23 @@ key.
 `MAX_DAILY_LOSS_PCT`, `MAX_WEEKLY_LOSS_PCT`, `MAX_DRAWDOWN_PCT`: hard breaker
 thresholds as whole percentages. Defaults are `5`, `10`, and `20`.
 
-`STRATEGIES_ENABLED`: comma-separated strategy names. Defaults to
-`cme_gap_fill,rsi_mean_reversion`.
+`STRATEGIES_ENABLED`: comma-separated strategy names. For the scalp suite use
+`micro_rsi_scalp,book_imbalance,volume_fade,rsi_mean_reversion,cme_gap_fill`.
 
 `STARTING_BALANCE_USD`: used for PnL snapshots before full history is available.
 
 `PAPER_SLIPPAGE_BPS`: simulated slippage in basis points. Defaults to `5`.
 
 `PAPER_MAX_PENDING_ORDERS`: max pending paper limit orders. Defaults to `10`.
+
+`SCALP_MODE_ENABLED`: set `false` to keep scalp strategies registered but muted.
+Defaults to `true`.
+
+`SCALP_MAX_HOLD_MINUTES`: max paper hold time for scalp positions. Defaults to
+`15`.
+
+`SCALP_COOLDOWN_SECONDS`: per-symbol scalp cooldown after a signal. Defaults to
+`600`.
 
 `CLOSE_POSITIONS_ON_SHUTDOWN`: reserved safety toggle for future shutdown
 behavior.
@@ -102,6 +111,15 @@ the gap is over `$200`.
 
 `rsi_mean_reversion`: checks RSI(5) on five-minute BTC/ETH bars. It goes long
 below `20`, short above `80`, and uses a `0.8%` stop.
+
+`micro_rsi_scalp`: aggregates incoming trades into one-minute bars, computes
+RSI(3), and scalps extreme readings below `15` or above `85`.
+
+`book_imbalance`: reads the top five L2 levels and scalps when bid or ask depth
+is more than `3x` the other side for three consecutive ticks.
+
+`volume_fade`: builds one-minute volume bars and fades 0.3% one-minute moves
+when volume is more than `3x` the rolling 20-minute average.
 
 ## Risk Controls
 

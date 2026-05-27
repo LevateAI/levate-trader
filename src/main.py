@@ -20,6 +20,7 @@ from src.logging import configure_logging
 from src.models import BTC_PERP, ETH_PERP, EquitySnapshot, MarketState
 from src.risk.circuit_breakers import CircuitBreakerManager
 from src.strategies import STRATEGY_REGISTRY, Strategy
+from src.strategies.scalp_common import SCALP_STRATEGY_NAMES
 
 logger = structlog.get_logger(__name__)
 
@@ -167,6 +168,9 @@ class TraderRuntime:
             mid=float(mid),
             last_trade_price=float(parsed.get("last_trade_price") or mid),
             bars_5m=bars,
+            trade_events=list(parsed.get("trade_events") or []),
+            book_bids=list(parsed.get("book_bids") or []),
+            book_asks=list(parsed.get("book_asks") or []),
             equity_usd=equity,
             open_positions=positions,
         )
@@ -307,7 +311,15 @@ class TraderRuntime:
             if strategy_cls is None:
                 logger.warning("strategy_unknown", strategy_name=name)
                 continue
-            strategies.append(strategy_cls())
+            if name in SCALP_STRATEGY_NAMES:
+                strategies.append(
+                    strategy_cls(  # type: ignore[call-arg]
+                        scalp_mode_enabled=self.settings.scalp_mode_enabled,
+                        cooldown_seconds=self.settings.scalp_cooldown_seconds,
+                    )
+                )
+            else:
+                strategies.append(strategy_cls())
             logger.info("strategy_loaded", strategy_name=name)
         return strategies
 
@@ -351,7 +363,7 @@ async def main() -> None:
     await runtime.run()
 
 
-def _parse_market_event(event: dict[str, Any]) -> dict[str, float]:
+def _parse_market_event(event: dict[str, Any]) -> dict[str, Any]:
     payload = event.get("payload") or {}
     data = payload.get("data", payload) if isinstance(payload, dict) else payload
     if isinstance(data, dict) and "levels" in data:
@@ -359,13 +371,19 @@ def _parse_market_event(event: dict[str, Any]) -> dict[str, float]:
         if len(levels) >= 2 and levels[0] and levels[1]:
             bid = float(levels[0][0]["px"])
             ask = float(levels[1][0]["px"])
-            return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
+            return {
+                "bid": bid,
+                "ask": ask,
+                "mid": (bid + ask) / 2,
+                "book_bids": list(levels[0]),
+                "book_asks": list(levels[1]),
+            }
     if isinstance(data, list) and data:
         last = data[-1]
         if isinstance(last, dict) and "px" in last:
-            return {"last_trade_price": float(last["px"])}
+            return {"last_trade_price": float(last["px"]), "trade_events": data}
     if isinstance(data, dict) and "px" in data:
-        return {"last_trade_price": float(data["px"])}
+        return {"last_trade_price": float(data["px"]), "trade_events": [data]}
     return {}
 
 

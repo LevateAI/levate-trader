@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -94,9 +94,11 @@ def _market(
     ask: float,
     last: float,
     symbol: str = BTC_PERP,
+    timestamp: datetime | None = None,
 ) -> MarketState:
     return MarketState(
         symbol=symbol,
+        timestamp=timestamp or datetime.now(tz=UTC),
         bid=bid,
         ask=ask,
         mid=(bid + ask) / 2,
@@ -109,6 +111,7 @@ def _signal(
     entry_price: float,
     stop_loss: float | None = None,
     take_profit: float | None = None,
+    strategy_name: str = "test_strategy",
 ) -> Signal:
     return Signal(
         side=side,
@@ -118,7 +121,7 @@ def _signal(
         stop_loss=stop_loss or entry_price * 0.99,
         take_profit=take_profit,
         reasoning="paper executor test signal",
-        strategy_name="test_strategy",
+        strategy_name=strategy_name,
         confidence=0.6,
     )
 
@@ -369,3 +372,39 @@ async def test_paper_restore_state_rehydrates_open_trade_and_position() -> None:
 
     assert BTC_PERP not in executor.open_positions
     assert repository.updates["trades"][-1]["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_scalp_position_closes_after_max_hold() -> None:
+    settings = _settings()
+    settings.scalp_max_hold_minutes = 1
+    repository = DummyRepository()
+    executor = _executor(settings=settings, repository=repository)
+    await executor.update_market_state(_market(bid=99, ask=100, last=99.5))
+    await executor.place_order(
+        BTC_PERP,
+        Side.BUY,
+        size=1,
+        price=0,
+        order_type=OrderType.MARKET,
+        signal=_signal(
+            Side.LONG,
+            entry_price=100,
+            stop_loss=50,
+            take_profit=200,
+            strategy_name="micro_rsi_scalp",
+        ),
+    )
+
+    assert executor.open_positions[BTC_PERP].max_hold_minutes == 1
+    await executor.update_market_state(
+        _market(
+            bid=100,
+            ask=100.2,
+            last=100,
+            timestamp=datetime.now(tz=UTC) + timedelta(minutes=2),
+        )
+    )
+
+    assert BTC_PERP not in executor.open_positions
+    assert repository.updates["trades"][-1]["reason_exit"] == "scalp max hold time reached"

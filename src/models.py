@@ -152,5 +152,8 @@ class MarketState(BaseModel):
     funding_rate: float | None = None
     open_interest: float | None = None
     bars_5m: list[dict[str, Any]] = Field(default_factory=list)
+    trade_events: list[dict[str, Any]] = Field(default_factory=list)
+    book_bids: list[dict[str, Any]] = Field(default_factory=list)
+    book_asks: list[dict[str, Any]] = Field(default_factory=list)
     equity_usd: float | None = None
     open_positions: list[Position] = Field(default_factory=list)
