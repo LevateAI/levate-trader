@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -12,6 +13,10 @@ from twilio.rest import Client
 from src.config import Settings
 
 logger = structlog.get_logger(__name__)
+
+SMS_FAILURE_DISABLE_THRESHOLD = 5
+FIRST_FAILURE_DISABLE_DURATION = timedelta(minutes=5)
+REPEATED_FAILURE_DISABLE_DURATION = timedelta(minutes=30)
 
 
 class TwilioNotifier:
@@ -26,6 +31,11 @@ class TwilioNotifier:
             self._client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker_task: asyncio.Task[None] | None = None
+        self._consecutive_failures = 0
+        self._disable_count = 0
+        self._disabled_until: datetime | None = None
+        self._send_interval_sec = 3.0
+        self._worker_error_sleep_sec = 5.0
 
     async def start(self) -> None:
         """Start the rate-limit worker."""
@@ -79,6 +89,9 @@ class TwilioNotifier:
         if not self._enabled:
             logger.info("sms_skipped", reason="disabled")
             return
+        if self._is_temporarily_disabled():
+            logger.info("sms_disabled_temporarily", disabled_until=self._disabled_until_iso())
+            return
         if self._client is None or not self._from_number or not self._to_number:
             logger.info("sms_skipped", reason="twilio_not_configured")
             return
@@ -86,15 +99,70 @@ class TwilioNotifier:
 
     async def _worker(self) -> None:
         while True:
-            message = await self._queue.get()
+            try:
+                await self._worker_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "sms_worker_error",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                await asyncio.sleep(self._worker_error_sleep_sec)
+
+    async def _worker_once(self) -> None:
+        message = await self._queue.get()
+        try:
+            if self._is_temporarily_disabled():
+                logger.info("sms_disabled_temporarily", disabled_until=self._disabled_until_iso())
+                return
             try:
                 await asyncio.to_thread(self._send_sync, message)
+                self._consecutive_failures = 0
+                self._disable_count = 0
+                self._disabled_until = None
                 logger.info("sms_sent")
-            except (OSError, RuntimeError, ValueError) as exc:
-                logger.error("sms_send_failed", error=str(exc))
-            finally:
-                self._queue.task_done()
-                await asyncio.sleep(3)
+            except Exception as exc:
+                self._handle_send_failure(exc)
+        finally:
+            self._queue.task_done()
+            await asyncio.sleep(self._send_interval_sec)
+
+    def _handle_send_failure(self, exc: Exception) -> None:
+        self._consecutive_failures += 1
+        logger.warning(
+            "sms_send_failed",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            consecutive_failures=self._consecutive_failures,
+        )
+        if self._consecutive_failures < SMS_FAILURE_DISABLE_THRESHOLD:
+            return
+        duration = (
+            FIRST_FAILURE_DISABLE_DURATION
+            if self._disable_count == 0
+            else REPEATED_FAILURE_DISABLE_DURATION
+        )
+        self._disabled_until = datetime.now(tz=UTC) + duration
+        self._disable_count += 1
+        self._consecutive_failures = 0
+        logger.warning(
+            "sms_disabled_after_failures",
+            disabled_until=self._disabled_until_iso(),
+            disabled_for_sec=duration.total_seconds(),
+        )
+
+    def _is_temporarily_disabled(self) -> bool:
+        if self._disabled_until is None:
+            return False
+        if datetime.now(tz=UTC) < self._disabled_until:
+            return True
+        self._disabled_until = None
+        return False
+
+    def _disabled_until_iso(self) -> str | None:
+        return self._disabled_until.isoformat() if self._disabled_until is not None else None
 
     def _send_sync(self, message: str) -> None:
         if self._client is None:

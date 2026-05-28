@@ -19,6 +19,8 @@ logger = structlog.get_logger(__name__)
 
 VOLUME_MULTIPLIER = 3.0
 MIN_MOVE_PCT = 0.003
+WARMUP_SECONDS = 20 * 60
+REQUIRED_BARS = 21
 
 
 class VolumeFadeStrategy(Strategy):
@@ -36,6 +38,8 @@ class VolumeFadeStrategy(Strategy):
         self._cooldown = timedelta(seconds=cooldown_seconds)
         self._bars = MinuteBarBuffer(max_bars=30)
         self._last_signal_at: dict[str, datetime] = {}
+        self._first_tick_at: dict[str, datetime] = {}
+        self._warmup_logged: set[str] = set()
 
     async def on_tick(self, market_state: dict[str, Any]) -> Signal | None:
         """Evaluate a one-minute volume spike."""
@@ -50,9 +54,12 @@ class VolumeFadeStrategy(Strategy):
             return None
 
         bars = self._bars.update_from_market_state(symbol, market_state)
-        if len(bars) < 21:
+        if not bars:
             return None
         now = coerce_datetime(market_state.get("timestamp"))
+        self._first_tick_at.setdefault(symbol, bars[0].minute)
+        if not self._warmup_complete(symbol, now, len(bars)):
+            return None
         if self._in_cooldown(symbol, now):
             return None
 
@@ -127,4 +134,20 @@ class VolumeFadeStrategy(Strategy):
         if now - last_signal_at < self._cooldown:
             logger.info("volume_fade_cooldown", symbol=symbol)
             return True
+        return False
+
+    def _warmup_complete(self, symbol: str, now: datetime, bar_count: int) -> bool:
+        first_tick_at = self._first_tick_at[symbol]
+        elapsed_sec = (now - first_tick_at).total_seconds()
+        if elapsed_sec >= WARMUP_SECONDS and bar_count >= REQUIRED_BARS:
+            return True
+        if symbol not in self._warmup_logged:
+            logger.info(
+                "strategy_warmup_pending",
+                strategy_name=self.name,
+                symbol=symbol,
+                elapsed_sec=round(elapsed_sec, 2),
+                required_sec=WARMUP_SECONDS,
+            )
+            self._warmup_logged.add(symbol)
         return False

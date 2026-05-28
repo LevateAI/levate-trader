@@ -23,6 +23,8 @@ logger = structlog.get_logger(__name__)
 
 TAKER_FEE_RATE = 0.00045
 MAKER_FEE_RATE = 0.00015
+MAX_FILL_MARKET_AGE_SECONDS = 10
+MAX_FILL_SPREAD_PCT = 0.05
 
 
 @dataclass(slots=True)
@@ -253,6 +255,8 @@ class PaperExecutor:
 
         if order_type == OrderType.MARKET:
             fill_price = self._market_fill_price(symbol, side)
+            if fill_price is None:
+                return {"status": "rejected", "reason": "invalid_market_state"}
             trade = await self._open_position(
                 symbol=symbol,
                 side=side,
@@ -514,6 +518,8 @@ class PaperExecutor:
         )
         if not crossed:
             return
+        if self._market_state_fill_rejection_reason(market_state) is not None:
+            return
         self.pending_orders.pop(order.oid, None)
         trade = await self._open_position(
             symbol=order.symbol,
@@ -577,14 +583,59 @@ class PaperExecutor:
         await self._repository.update("positions", trade_id, self._position_payload(UUID(trade_id), position))
         self._last_position_row_update[symbol] = now
 
-    def _market_fill_price(self, symbol: str, side: Side) -> float:
+    def _market_fill_price(self, symbol: str, side: Side) -> float | None:
         market_state = self._latest_market.get(symbol)
         if market_state is None:
-            raise ValueError(f"no paper market state available for {symbol}")
+            logger.warning(
+                "paper_fill_rejected_invalid_market",
+                symbol=symbol,
+                reason="missing_market",
+            )
+            return None
+        if self._market_state_fill_rejection_reason(market_state) is not None:
+            return None
         slippage = self._settings.paper_slippage_bps / 10_000
         if side in {Side.BUY, Side.LONG}:
             return _money(market_state.ask * (1 + slippage))
         return _money(market_state.bid * (1 - slippage))
+
+    def _market_state_fill_rejection_reason(self, market_state: MarketState) -> str | None:
+        now = datetime.now(tz=UTC)
+        market_timestamp = (
+            market_state.timestamp
+            if market_state.timestamp.tzinfo
+            else market_state.timestamp.replace(tzinfo=UTC)
+        )
+        market_age_sec = abs((now - market_timestamp).total_seconds())
+        if market_age_sec > MAX_FILL_MARKET_AGE_SECONDS:
+            logger.warning(
+                "paper_fill_rejected_stale_market",
+                symbol=market_state.symbol,
+                market_age_sec=round(market_age_sec, 2),
+                max_age_sec=MAX_FILL_MARKET_AGE_SECONDS,
+            )
+            return "stale_market"
+        if market_state.bid <= 0 or market_state.ask <= 0:
+            logger.warning(
+                "paper_fill_rejected_invalid_market",
+                symbol=market_state.symbol,
+                bid=market_state.bid,
+                ask=market_state.ask,
+                reason="non_positive_price",
+            )
+            return "non_positive_price"
+        spread_pct = (market_state.ask - market_state.bid) / market_state.bid
+        if spread_pct >= MAX_FILL_SPREAD_PCT:
+            logger.warning(
+                "paper_fill_rejected_invalid_market",
+                symbol=market_state.symbol,
+                bid=market_state.bid,
+                ask=market_state.ask,
+                spread_pct=spread_pct,
+                reason="spread_too_wide",
+            )
+            return "spread_too_wide"
+        return None
 
     def _exit_fill_price(self, position: PaperPosition, trigger_price: float) -> float:
         slippage = self._settings.paper_slippage_bps / 10_000

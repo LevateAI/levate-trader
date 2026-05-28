@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from src.config import Settings
-from src.main import TraderRuntime
+from src.main import TraderRuntime, _parse_market_event
 from src.models import BTC_PERP
 
 
@@ -97,3 +97,25 @@ async def test_build_market_state_refreshes_stale_bars_cache() -> None:
     await runtime._build_market_state(BTC_PERP, event)
 
     assert exchange.get_candles_calls == 1
+
+
+def test_parse_market_event_preserves_full_l2_levels() -> None:
+    event = {
+        "channel": "book",
+        "symbol": BTC_PERP,
+        "payload": {
+            "data": {
+                "levels": [
+                    [{"px": str(100 - index), "sz": "1"} for index in range(6)],
+                    [{"px": str(101 + index), "sz": "2"} for index in range(6)],
+                ]
+            }
+        },
+    }
+
+    parsed = _parse_market_event(event)
+
+    assert parsed["bid"] == 100
+    assert parsed["ask"] == 101
+    assert len(parsed["bid_levels"]) == 6
+    assert len(parsed["ask_levels"]) == 6

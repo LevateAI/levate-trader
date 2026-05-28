@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -37,8 +38,11 @@ class HyperliquidClient:
         self._info: Info | None = None
         self._exchange: Exchange | None = None
         self._subscriptions: list[tuple[dict[str, Any], Callable[[Any], None]]] = []
-        self.market_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=10_000)
+        self.market_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50_000)
         self._last_event_at = datetime.now(tz=UTC)
+        self.dropped_event_counter = 0
+        self._drop_timestamps: deque[datetime] = deque()
+        self._force_reconnect_due_to_drops = False
 
     async def connect_ws(self) -> None:
         """Create SDK clients with websocket support."""
@@ -78,6 +82,17 @@ class HyperliquidClient:
         while True:
             await asyncio.sleep(check_interval_sec)
             now = datetime.now(tz=UTC)
+            if getattr(self, "_force_reconnect_due_to_drops", False):
+                logger.error(
+                    "websocket_reconnect_forced_by_drops",
+                    dropped_event_counter=getattr(self, "dropped_event_counter", 0),
+                )
+                await self.reconnect_with_backoff()
+                self._force_reconnect_due_to_drops = False
+                if hasattr(self, "_drop_timestamps"):
+                    self._drop_timestamps.clear()
+                self._last_event_at = datetime.now(tz=UTC)
+                continue
             last_event_age_sec = (now - self._last_event_at).total_seconds()
             if last_event_age_sec <= stale_threshold_sec:
                 continue
@@ -284,11 +299,32 @@ class HyperliquidClient:
         try:
             self.market_events.put_nowait(event)
         except asyncio.QueueFull:
+            self._record_dropped_event(event)
+
+    def _record_dropped_event(self, event: dict[str, Any]) -> None:
+        now = datetime.now(tz=UTC)
+        if not hasattr(self, "dropped_event_counter"):
+            self.dropped_event_counter = 0
+        if not hasattr(self, "_drop_timestamps"):
+            self._drop_timestamps = deque()
+        self.dropped_event_counter += 1
+        self._drop_timestamps.append(now)
+        while self._drop_timestamps and (now - self._drop_timestamps[0]).total_seconds() > 60:
+            self._drop_timestamps.popleft()
+        logger.error(
+            "hyperliquid_market_queue_full",
+            channel=event.get("channel"),
+            symbol=event.get("symbol"),
+            dropped_event_counter=self.dropped_event_counter,
+        )
+        if self.dropped_event_counter % 10 == 0:
             logger.error(
-                "hyperliquid_market_queue_full",
-                channel=event.get("channel"),
-                symbol=event.get("symbol"),
+                "market_event_drops_high",
+                dropped_event_counter=self.dropped_event_counter,
+                dropped_events_60s=len(self._drop_timestamps),
             )
+        if len(self._drop_timestamps) > 1000:
+            self._force_reconnect_due_to_drops = True
 
     def _info_required(self) -> Info:
         if self._info is None:

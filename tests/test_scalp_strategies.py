@@ -60,14 +60,15 @@ def _book_state(
     bid_size: float,
     ask_size: float,
     timestamp: datetime | None = None,
+    levels: int = 5,
 ) -> dict[str, Any]:
-    bids = [{"px": "100", "sz": str(bid_size)} for _ in range(5)]
-    asks = [{"px": "101", "sz": str(ask_size)} for _ in range(5)]
+    bids = [{"px": "100", "sz": str(bid_size)} for _ in range(levels)]
+    asks = [{"px": "101", "sz": str(ask_size)} for _ in range(levels)]
     return _market_state(timestamp=timestamp) | {
         "bid": 100,
         "ask": 101,
-        "book_bids": bids,
-        "book_asks": asks,
+        "bid_levels": bids,
+        "ask_levels": asks,
     }
 
 
@@ -75,7 +76,7 @@ def _book_state(
 async def test_micro_rsi_scalp_fires_on_extreme_low() -> None:
     strategy = MicroRsiScalpStrategy()
 
-    signal = await strategy.on_tick(_market_state(bars_1m=_bars_1m([100, 99, 98, 97])))
+    signal = await strategy.on_tick(_market_state(bars_1m=_bars_1m(list(range(130, 100, -1)))))
 
     assert signal is not None
     assert signal.side == Side.LONG
@@ -87,7 +88,7 @@ async def test_micro_rsi_scalp_fires_on_extreme_low() -> None:
 async def test_micro_rsi_scalp_fires_on_extreme_high() -> None:
     strategy = MicroRsiScalpStrategy()
 
-    signal = await strategy.on_tick(_market_state(bars_1m=_bars_1m([100, 101, 102, 103])))
+    signal = await strategy.on_tick(_market_state(bars_1m=_bars_1m(list(range(100, 130)))))
 
     assert signal is not None
     assert signal.side == Side.SHORT
@@ -98,7 +99,7 @@ async def test_micro_rsi_scalp_fires_on_extreme_high() -> None:
 @pytest.mark.asyncio
 async def test_micro_rsi_scalp_respects_cooldown() -> None:
     strategy = MicroRsiScalpStrategy(cooldown_seconds=600)
-    bars = _bars_1m([100, 99, 98, 97])
+    bars = _bars_1m(list(range(130, 100, -1)))
     timestamp = datetime(2026, 5, 26, 12, 30, tzinfo=UTC)
 
     first = await strategy.on_tick(_market_state(bars_1m=bars, timestamp=timestamp))
@@ -114,7 +115,19 @@ async def test_micro_rsi_scalp_respects_cooldown() -> None:
 async def test_micro_rsi_scalp_no_signal_in_neutral_zone() -> None:
     strategy = MicroRsiScalpStrategy()
 
-    signal = await strategy.on_tick(_market_state(bars_1m=_bars_1m([100, 101, 100, 101, 100])))
+    signal = await strategy.on_tick(_market_state(bars_1m=_bars_1m([100, 101] * 15)))
+
+    assert signal is None
+
+
+@pytest.mark.asyncio
+async def test_rsi_scalp_warmup_required() -> None:
+    strategy = MicroRsiScalpStrategy()
+    timestamp = datetime(2026, 5, 26, 12, 29, 59, tzinfo=UTC)
+
+    signal = await strategy.on_tick(
+        _market_state(bars_1m=_bars_1m(list(range(130, 100, -1))), timestamp=timestamp)
+    )
 
     assert signal is None
 
@@ -122,10 +135,20 @@ async def test_micro_rsi_scalp_no_signal_in_neutral_zone() -> None:
 @pytest.mark.asyncio
 async def test_book_imbalance_fires_on_bid_heavy() -> None:
     strategy = BookImbalanceStrategy()
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
 
-    assert await strategy.on_tick(_book_state(10, 1)) is None
-    assert await strategy.on_tick(_book_state(10, 1)) is None
-    signal = await strategy.on_tick(_book_state(10, 1))
+    assert await strategy.on_tick(_book_state(1000, 100, timestamp=start)) is None
+    assert (
+        await strategy.on_tick(_book_state(1000, 100, timestamp=start + timedelta(seconds=61)))
+        is None
+    )
+    assert (
+        await strategy.on_tick(_book_state(1000, 100, timestamp=start + timedelta(seconds=62)))
+        is None
+    )
+    signal = await strategy.on_tick(
+        _book_state(1000, 100, timestamp=start + timedelta(seconds=63))
+    )
 
     assert signal is not None
     assert signal.side == Side.LONG
@@ -135,10 +158,12 @@ async def test_book_imbalance_fires_on_bid_heavy() -> None:
 @pytest.mark.asyncio
 async def test_book_imbalance_fires_on_ask_heavy() -> None:
     strategy = BookImbalanceStrategy()
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
 
-    await strategy.on_tick(_book_state(1, 10))
-    await strategy.on_tick(_book_state(1, 10))
-    signal = await strategy.on_tick(_book_state(1, 10))
+    await strategy.on_tick(_book_state(100, 1000, timestamp=start))
+    await strategy.on_tick(_book_state(100, 1000, timestamp=start + timedelta(seconds=61)))
+    await strategy.on_tick(_book_state(100, 1000, timestamp=start + timedelta(seconds=62)))
+    signal = await strategy.on_tick(_book_state(100, 1000, timestamp=start + timedelta(seconds=63)))
 
     assert signal is not None
     assert signal.side == Side.SHORT
@@ -148,9 +173,65 @@ async def test_book_imbalance_fires_on_ask_heavy() -> None:
 @pytest.mark.asyncio
 async def test_book_imbalance_requires_persistence() -> None:
     strategy = BookImbalanceStrategy()
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
 
-    assert await strategy.on_tick(_book_state(10, 1)) is None
-    assert await strategy.on_tick(_book_state(10, 1)) is None
+    assert await strategy.on_tick(_book_state(1000, 100, timestamp=start)) is None
+    assert (
+        await strategy.on_tick(_book_state(1000, 100, timestamp=start + timedelta(seconds=61)))
+        is None
+    )
+    assert (
+        await strategy.on_tick(_book_state(1000, 100, timestamp=start + timedelta(seconds=62)))
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_book_imbalance_warmup_required() -> None:
+    strategy = BookImbalanceStrategy()
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+
+    assert await strategy.on_tick(_book_state(1000, 100, timestamp=start)) is None
+    assert (
+        await strategy.on_tick(_book_state(1000, 100, timestamp=start + timedelta(seconds=1)))
+        is None
+    )
+    assert (
+        await strategy.on_tick(_book_state(1000, 100, timestamp=start + timedelta(seconds=2)))
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_book_imbalance_rejects_thin_book() -> None:
+    strategy = BookImbalanceStrategy()
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+
+    await strategy.on_tick(_book_state(1000, 100, timestamp=start, levels=4))
+    await strategy.on_tick(
+        _book_state(1000, 100, timestamp=start + timedelta(seconds=61), levels=4)
+    )
+    await strategy.on_tick(
+        _book_state(1000, 100, timestamp=start + timedelta(seconds=62), levels=4)
+    )
+    signal = await strategy.on_tick(
+        _book_state(1000, 100, timestamp=start + timedelta(seconds=63), levels=4)
+    )
+
+    assert signal is None
+
+
+@pytest.mark.asyncio
+async def test_book_imbalance_rejects_anomaly_ratio() -> None:
+    strategy = BookImbalanceStrategy()
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+
+    await strategy.on_tick(_book_state(500, 20, timestamp=start))
+    await strategy.on_tick(_book_state(500, 20, timestamp=start + timedelta(seconds=61)))
+    await strategy.on_tick(_book_state(500, 20, timestamp=start + timedelta(seconds=62)))
+    signal = await strategy.on_tick(_book_state(500, 20, timestamp=start + timedelta(seconds=63)))
+
+    assert signal is None
 
 
 @pytest.mark.asyncio
@@ -158,13 +239,14 @@ async def test_book_imbalance_respects_cooldown() -> None:
     strategy = BookImbalanceStrategy(cooldown_seconds=600)
     timestamp = datetime(2026, 5, 26, 12, 30, tzinfo=UTC)
 
-    for offset in range(3):
+    assert await strategy.on_tick(_book_state(1000, 100, timestamp=timestamp)) is None
+    for offset in range(61, 64):
         signal = await strategy.on_tick(
-            _book_state(10, 1, timestamp=timestamp + timedelta(seconds=offset))
+            _book_state(1000, 100, timestamp=timestamp + timedelta(seconds=offset))
         )
     assert signal is not None
     cooldown_signal = await strategy.on_tick(
-        _book_state(10, 1, timestamp=timestamp + timedelta(seconds=60))
+        _book_state(1000, 100, timestamp=timestamp + timedelta(seconds=64))
     )
 
     assert cooldown_signal is None
@@ -217,3 +299,16 @@ async def test_volume_fade_respects_cooldown() -> None:
 
     assert first is not None
     assert second is None
+
+
+@pytest.mark.asyncio
+async def test_volume_fade_warmup_required() -> None:
+    strategy = VolumeFadeStrategy()
+    bars = _bars_1m([100] * 20 + [99.6], [10] * 20 + [40])
+    timestamp = datetime(2026, 5, 26, 12, 19, 59, tzinfo=UTC)
+
+    signal = await strategy.on_tick(
+        _market_state(bars_1m=bars, bid=99.5, ask=99.7, timestamp=timestamp)
+    )
+
+    assert signal is None

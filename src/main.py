@@ -169,8 +169,10 @@ class TraderRuntime:
             last_trade_price=float(parsed.get("last_trade_price") or mid),
             bars_5m=bars,
             trade_events=list(parsed.get("trade_events") or []),
-            book_bids=list(parsed.get("book_bids") or []),
-            book_asks=list(parsed.get("book_asks") or []),
+            bid_levels=parsed.get("bid_levels"),
+            ask_levels=parsed.get("ask_levels"),
+            book_bids=list(parsed.get("bid_levels") or []),
+            book_asks=list(parsed.get("ask_levels") or []),
             equity_usd=equity,
             open_positions=positions,
         )
@@ -375,8 +377,8 @@ def _parse_market_event(event: dict[str, Any]) -> dict[str, Any]:
                 "bid": bid,
                 "ask": ask,
                 "mid": (bid + ask) / 2,
-                "book_bids": list(levels[0]),
-                "book_asks": list(levels[1]),
+                "bid_levels": list(levels[0]),
+                "ask_levels": list(levels[1]),
             }
     if isinstance(data, list) and data:
         last = data[-1]

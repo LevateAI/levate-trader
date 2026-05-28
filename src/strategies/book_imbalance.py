@@ -13,8 +13,11 @@ from src.strategies.scalp_common import coerce_datetime, has_open_position
 
 logger = structlog.get_logger(__name__)
 
-IMBALANCE_THRESHOLD = 3.0
+IMBALANCE_THRESHOLD = 5.0
+IMBALANCE_ANOMALY_RATIO = 20.0
+MIN_SIDE_DEPTH_USD = 10_000.0
 PERSISTENCE_TICKS = 3
+WARMUP_SECONDS = 60
 
 
 class BookImbalanceStrategy(Strategy):
@@ -33,6 +36,8 @@ class BookImbalanceStrategy(Strategy):
         self._last_signal_at: dict[str, datetime] = {}
         self._persistent_side: dict[str, Side | None] = {}
         self._persistent_count: dict[str, int] = {}
+        self._first_book_received_at: dict[str, datetime] = {}
+        self._warmup_logged: set[str] = set()
 
     async def on_tick(self, market_state: dict[str, Any]) -> Signal | None:
         """Evaluate an L2 book update."""
@@ -44,9 +49,23 @@ class BookImbalanceStrategy(Strategy):
         if has_open_position(list(market_state.get("open_positions") or []), symbol):
             return None
 
-        bid_depth = _depth(_book_side(market_state, "bid"))
-        ask_depth = _depth(_book_side(market_state, "ask"))
-        if bid_depth <= 0 or ask_depth <= 0:
+        now = coerce_datetime(market_state.get("timestamp"))
+        bid_levels = _book_side(market_state, "bid")
+        ask_levels = _book_side(market_state, "ask")
+        if not bid_levels or not ask_levels:
+            return None
+        if symbol not in self._first_book_received_at:
+            self._first_book_received_at[symbol] = now
+        if not self._warmup_complete(symbol, now):
+            self._reset(symbol)
+            return None
+        if len(bid_levels) < 5 or len(ask_levels) < 5:
+            self._reset(symbol)
+            return None
+
+        bid_depth = _depth(bid_levels)
+        ask_depth = _depth(ask_levels)
+        if bid_depth < MIN_SIDE_DEPTH_USD or ask_depth < MIN_SIDE_DEPTH_USD:
             self._reset(symbol)
             return None
 
@@ -62,11 +81,21 @@ class BookImbalanceStrategy(Strategy):
             self._reset(symbol)
             return None
 
+        if ratio > IMBALANCE_ANOMALY_RATIO:
+            logger.warning(
+                "book_imbalance_anomaly_rejected",
+                symbol=symbol,
+                bid_depth=bid_depth,
+                ask_depth=ask_depth,
+                ratio=ratio,
+            )
+            self._reset(symbol)
+            return None
+
         self._record_persistence(symbol, side)
         if self._persistent_count.get(symbol, 0) < PERSISTENCE_TICKS:
             return None
 
-        now = coerce_datetime(market_state.get("timestamp"))
         if self._in_cooldown(symbol, now):
             return None
 
@@ -128,6 +157,22 @@ class BookImbalanceStrategy(Strategy):
         self._persistent_side[symbol] = None
         self._persistent_count[symbol] = 0
 
+    def _warmup_complete(self, symbol: str, now: datetime) -> bool:
+        first_book_at = self._first_book_received_at[symbol]
+        elapsed_sec = (now - first_book_at).total_seconds()
+        if elapsed_sec >= WARMUP_SECONDS:
+            return True
+        if symbol not in self._warmup_logged:
+            logger.info(
+                "strategy_warmup_pending",
+                strategy_name=self.name,
+                symbol=symbol,
+                elapsed_sec=round(elapsed_sec, 2),
+                required_sec=WARMUP_SECONDS,
+            )
+            self._warmup_logged.add(symbol)
+        return False
+
     def _in_cooldown(self, symbol: str, now: datetime) -> bool:
         last_signal_at = self._last_signal_at.get(symbol)
         if last_signal_at is None:
@@ -139,9 +184,12 @@ class BookImbalanceStrategy(Strategy):
 
 
 def _book_side(market_state: dict[str, Any], side: str) -> list[dict[str, Any]]:
-    direct_key = "book_bids" if side == "bid" else "book_asks"
+    direct_key = "bid_levels" if side == "bid" else "ask_levels"
     if market_state.get(direct_key):
         return list(market_state[direct_key])
+    legacy_key = "book_bids" if side == "bid" else "book_asks"
+    if market_state.get(legacy_key):
+        return list(market_state[legacy_key])
     levels = market_state.get("book_levels") or {}
     if isinstance(levels, dict):
         key = "bids" if side == "bid" else "asks"

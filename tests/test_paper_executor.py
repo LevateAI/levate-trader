@@ -163,6 +163,60 @@ async def test_paper_market_sell_fills_at_bid_minus_slippage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rejects_fill_on_stale_market() -> None:
+    executor = _executor()
+    stale_timestamp = datetime.now(tz=UTC) - timedelta(seconds=11)
+    await executor.update_market_state(
+        _market(bid=99, ask=100, last=99.5, timestamp=stale_timestamp)
+    )
+
+    result = await executor.place_order(
+        BTC_PERP,
+        Side.BUY,
+        size=1,
+        price=0,
+        order_type=OrderType.MARKET,
+    )
+
+    assert result["status"] == "rejected"
+    assert BTC_PERP not in executor.open_positions
+
+
+@pytest.mark.asyncio
+async def test_rejects_fill_on_zero_price() -> None:
+    executor = _executor()
+    await executor.update_market_state(_market(bid=0, ask=100, last=50))
+
+    result = await executor.place_order(
+        BTC_PERP,
+        Side.BUY,
+        size=1,
+        price=0,
+        order_type=OrderType.MARKET,
+    )
+
+    assert result["status"] == "rejected"
+    assert BTC_PERP not in executor.open_positions
+
+
+@pytest.mark.asyncio
+async def test_rejects_fill_on_huge_spread() -> None:
+    executor = _executor()
+    await executor.update_market_state(_market(bid=100, ask=106, last=103))
+
+    result = await executor.place_order(
+        BTC_PERP,
+        Side.BUY,
+        size=1,
+        price=0,
+        order_type=OrderType.MARKET,
+    )
+
+    assert result["status"] == "rejected"
+    assert BTC_PERP not in executor.open_positions
+
+
+@pytest.mark.asyncio
 async def test_paper_limit_order_pending_until_crossed() -> None:
     executor = _executor()
     await executor.update_market_state(_market(bid=100, ask=101, last=100.5))
