@@ -117,7 +117,7 @@ class TraderRuntime:
                     await self.executor.execute_signal(signal_result, equity, vol)
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("market_loop_error", error=str(exc), error_type=type(exc).__name__)
-                self.sms.send_error(exc)
+                self._safe_send_sms_error(exc)
                 await asyncio.sleep(1)
 
     async def _snapshot_loop(self) -> None:
@@ -133,7 +133,7 @@ class TraderRuntime:
                         await self.exchange.close_all_positions()
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("snapshot_loop_error", error=str(exc), error_type=type(exc).__name__)
-                self.sms.send_error(exc)
+                self._safe_send_sms_error(exc)
             self._log_http_calls_per_minute()
             await asyncio.sleep(60)
 
@@ -327,11 +327,29 @@ class TraderRuntime:
 
     async def _shutdown(self) -> None:
         self.exchange.disconnect()
-        await self.sms.stop()
+        try:
+            await self.sms.stop()
+        except Exception as exc:
+            logger.warning(
+                "sms_stop_failed",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
         logger.info(
             "runtime_shutdown_complete",
             close_positions_on_shutdown=self.settings.close_positions_on_shutdown,
         )
+
+    def _safe_send_sms_error(self, exc: Exception) -> None:
+        try:
+            self.sms.send_error(exc)
+        except Exception as sms_exc:
+            logger.warning(
+                "sms_error_notification_failed",
+                original_error_type=type(exc).__name__,
+                error_type=type(sms_exc).__name__,
+                error_message=str(sms_exc),
+            )
 
     def _log_startup_banner(self) -> None:
         if self.settings.execution_mode == "paper_sim":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,6 +23,7 @@ class DummyExecutor:
 class DummyExchange:
     def __init__(self) -> None:
         self.get_candles_calls = 0
+        self.market_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def get_candles(
         self,
@@ -119,3 +121,31 @@ def test_parse_market_event_preserves_full_l2_levels() -> None:
     assert parsed["ask"] == 101
     assert len(parsed["bid_levels"]) == 6
     assert len(parsed["ask_levels"]) == 6
+
+
+@pytest.mark.asyncio
+async def test_market_loop_sms_failure_does_not_crash_loop() -> None:
+    runtime, exchange = _runtime()
+    send_error_calls = 0
+
+    class ExplodingSms:
+        def send_error(self, _: Exception) -> None:
+            nonlocal send_error_calls
+            send_error_calls += 1
+            raise RuntimeError("sms queue corrupted")
+
+    runtime.sms = ExplodingSms()
+    await exchange.market_events.put(
+        {"channel": "book", "symbol": BTC_PERP, "payload": {"data": {}}}
+    )
+
+    task = asyncio.create_task(runtime._market_loop([]))
+    try:
+        await asyncio.sleep(0.05)
+
+        assert send_error_calls == 1
+        assert not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
