@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     scalp_mode_enabled: bool = True
     scalp_max_hold_minutes: int = 15
     scalp_cooldown_seconds: int = 600
+    stale_threshold_sec: int = 20
     chaos_mode: bool = False
     market_data_writer: bool = True
     close_positions_on_shutdown: bool = False
@@ -87,12 +88,12 @@ class Settings(BaseSettings):
             raise ValueError("risk and leverage values must be positive")
         return value
 
-    @field_validator("scalp_max_hold_minutes", "scalp_cooldown_seconds")
+    @field_validator("scalp_max_hold_minutes", "scalp_cooldown_seconds", "stale_threshold_sec")
     @classmethod
     def validate_scalp_positive_ints(cls, value: int) -> int:
-        """Validate positive scalp runtime limits."""
+        """Validate positive runtime limits."""
         if value <= 0:
-            raise ValueError("scalp runtime limits must be positive")
+            raise ValueError("runtime limits must be positive")
         return value
 
     @field_validator("hyperliquid_private_key", "hyperliquid_account_address", mode="before")

@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
+import time
 from typing import Any
 
 import eth_account
@@ -40,6 +41,8 @@ class HyperliquidClient:
         self._subscriptions: list[tuple[dict[str, Any], Callable[[Any], None]]] = []
         self.market_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50_000)
         self._last_event_at = datetime.now(tz=UTC)
+        self._last_message_at = time.monotonic()
+        self._last_message_log_at = 0.0
         self.dropped_event_counter = 0
         self._drop_timestamps: deque[datetime] = deque()
         self._force_reconnect_due_to_drops = False
@@ -47,41 +50,46 @@ class HyperliquidClient:
     async def connect_ws(self) -> None:
         """Create SDK clients with websocket support."""
         logger.info(
-            "hyperliquid_connecting",
+            "ws_connecting",
             base_url=self._base_url,
             execution_mode=self._settings.execution_mode,
         )
         await asyncio.to_thread(self._connect_sync)
+        self._last_message_at = time.monotonic()
         if self._settings.execution_mode == "testnet_real":
             for coin in SYMBOL_TO_COIN.values():
                 await asyncio.to_thread(self._exchange_required().update_leverage, 10, coin, True)
-        logger.info("hyperliquid_connected")
+        logger.info("ws_connected", base_url=self._base_url)
 
     async def reconnect_with_backoff(self) -> None:
         """Reconnect websocket subscriptions with exponential backoff."""
         delay = 1.0
         while True:
             try:
+                logger.warning("ws_reconnecting", subscription_count=len(self._subscriptions))
                 self.disconnect()
                 await self.connect_ws()
-                for subscription, callback in list(self._subscriptions):
-                    await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
-                logger.info("hyperliquid_reconnected")
+                await self._resubscribe_all_and_verify()
+                logger.info("ws_reconnected", subscription_count=len(self._subscriptions))
                 return
             except (OSError, RuntimeError, ValueError) as exc:
-                logger.error("hyperliquid_reconnect_failed", error=str(exc), delay=delay)
+                logger.error(
+                    "ws_reconnect_failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    delay=delay,
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
     async def watchdog_loop(
         self,
-        stale_threshold_sec: int = 30,
-        check_interval_sec: int = 10,
+        stale_threshold_sec: int = 20,
+        check_interval_sec: int = 5,
     ) -> None:
-        """Reconnect when no websocket events have arrived recently."""
+        """Reconnect when no websocket messages have arrived recently."""
         while True:
             await asyncio.sleep(check_interval_sec)
-            now = datetime.now(tz=UTC)
             if getattr(self, "_force_reconnect_due_to_drops", False):
                 logger.error(
                     "websocket_reconnect_forced_by_drops",
@@ -92,16 +100,20 @@ class HyperliquidClient:
                 if hasattr(self, "_drop_timestamps"):
                     self._drop_timestamps.clear()
                 self._last_event_at = datetime.now(tz=UTC)
+                self._last_message_at = time.monotonic()
                 continue
-            last_event_age_sec = (now - self._last_event_at).total_seconds()
-            if last_event_age_sec <= stale_threshold_sec:
+            now = time.monotonic()
+            silent_for_sec = now - self._last_message_at
+            if silent_for_sec <= stale_threshold_sec:
                 continue
             logger.warning(
-                "websocket_stale_detected",
-                last_event_age_sec=round(last_event_age_sec, 2),
+                "ws_stale_detected",
+                silent_for_sec=round(silent_for_sec, 2),
                 stale_threshold_sec=stale_threshold_sec,
             )
+            self.disconnect()
             await self.reconnect_with_backoff()
+            self._last_message_at = time.monotonic()
             self._last_event_at = datetime.now(tz=UTC)
 
     async def subscribe_to_book(self, symbol: str) -> None:
@@ -110,8 +122,7 @@ class HyperliquidClient:
         subscription = {"type": "l2Book", "coin": coin}
         callback = self._queue_callback("book", symbol)
         self._subscriptions.append((subscription, callback))
-        await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
-        logger.info("hyperliquid_subscribed_book", symbol=symbol)
+        await self._subscribe(subscription, callback, symbol=symbol, verify_message=True)
 
     async def subscribe_to_trades(self, symbol: str) -> None:
         """Subscribe to public trades."""
@@ -119,8 +130,7 @@ class HyperliquidClient:
         subscription = {"type": "trades", "coin": coin}
         callback = self._queue_callback("trades", symbol)
         self._subscriptions.append((subscription, callback))
-        await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
-        logger.info("hyperliquid_subscribed_trades", symbol=symbol)
+        await self._subscribe(subscription, callback, symbol=symbol, verify_message=True)
 
     async def subscribe_to_user_fills(self) -> None:
         """Subscribe to user fill events."""
@@ -134,8 +144,7 @@ class HyperliquidClient:
         subscription = {"type": "userFills", "user": self._settings.hyperliquid_account_address}
         callback = self._queue_callback("user_fills", None)
         self._subscriptions.append((subscription, callback))
-        await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
-        logger.info("hyperliquid_subscribed_user_fills")
+        await self._subscribe(subscription, callback, symbol=None, verify_message=False)
 
     async def get_account_state(self, address: str | None = None) -> dict[str, Any]:
         """Fetch account clearinghouse state."""
@@ -266,7 +275,7 @@ class HyperliquidClient:
 
     def disconnect(self) -> None:
         """Disconnect websocket resources."""
-        if self._info is not None:
+        if getattr(self, "_info", None) is not None:
             try:
                 self._info.disconnect_websocket()
             except RuntimeError as exc:
@@ -289,10 +298,18 @@ class HyperliquidClient:
         loop = asyncio.get_running_loop()
 
         def callback(message: Any) -> None:
+            self._record_message_received()
             event = {"channel": channel, "symbol": symbol, "payload": message}
             loop.call_soon_threadsafe(self._safe_queue_event, event)
 
         return callback
+
+    def _record_message_received(self) -> None:
+        now = time.monotonic()
+        self._last_message_at = now
+        if now - self._last_message_log_at >= 30:
+            logger.debug("ws_message_received")
+            self._last_message_log_at = now
 
     def _safe_queue_event(self, event: dict[str, Any]) -> None:
         self._last_event_at = datetime.now(tz=UTC)
@@ -300,6 +317,44 @@ class HyperliquidClient:
             self.market_events.put_nowait(event)
         except asyncio.QueueFull:
             self._record_dropped_event(event)
+
+    async def _subscribe(
+        self,
+        subscription: dict[str, Any],
+        callback: Callable[[Any], None],
+        symbol: str | None,
+        verify_message: bool,
+    ) -> None:
+        before = self._last_message_at
+        await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
+        logger.info(
+            "ws_subscribed",
+            subscription_type=subscription.get("type"),
+            symbol=symbol,
+        )
+        if verify_message:
+            await self._wait_for_message_after(before, timeout_sec=10)
+
+    async def _resubscribe_all_and_verify(self) -> None:
+        if not self._subscriptions:
+            return
+        before = self._last_message_at
+        for subscription, callback in list(self._subscriptions):
+            await asyncio.to_thread(self._info_required().subscribe, subscription, callback)
+            logger.info(
+                "ws_subscribed",
+                subscription_type=subscription.get("type"),
+                coin=subscription.get("coin"),
+            )
+        await self._wait_for_message_after(before, timeout_sec=10)
+
+    async def _wait_for_message_after(self, previous_message_at: float, timeout_sec: float) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self._last_message_at > previous_message_at:
+                return
+            await asyncio.sleep(0.1)
+        raise RuntimeError("no websocket messages received after subscription re-arm")
 
     def _record_dropped_event(self, event: dict[str, Any]) -> None:
         now = datetime.now(tz=UTC)

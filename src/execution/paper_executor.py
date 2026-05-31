@@ -23,7 +23,6 @@ logger = structlog.get_logger(__name__)
 
 TAKER_FEE_RATE = 0.00045
 MAKER_FEE_RATE = 0.00015
-MAX_FILL_MARKET_AGE_SECONDS = 10
 MAX_FILL_SPREAD_PCT = 0.05
 
 
@@ -194,6 +193,10 @@ class PaperExecutor:
     ) -> dict[str, Any] | None:
         """Check risk, size the signal, and simulate an order."""
         await self._log_strategy_signal(signal, action_taken="received")
+        market_state = self._latest_market.get(signal.symbol)
+        if market_state is None or self._market_state_stale_reason(market_state) is not None:
+            await self._log_strategy_signal(signal, action_taken="rejected_stale_price")
+            return None
         if signal.reduce_only:
             trade = await self.close_position(signal.symbol, signal.entry_price, signal.reasoning)
             await self._log_strategy_signal(signal, action_taken="paper_exit_filled")
@@ -293,6 +296,8 @@ class PaperExecutor:
     async def update_market_state(self, market_state: MarketState) -> None:
         """Update latest market state and evaluate paper orders/positions."""
         self._latest_market[market_state.symbol] = market_state
+        if self._market_state_stale_reason(market_state) is not None:
+            return
         await self._check_pending_orders(market_state.symbol, market_state)
         await self._check_position_exit(
             market_state.symbol,
@@ -349,6 +354,15 @@ class PaperExecutor:
         position = self.open_positions.get(symbol)
         if position is None:
             logger.info("paper_close_skipped_no_position", symbol=symbol)
+            return None
+        market_state = self._latest_market.get(symbol)
+        if market_state is None or self._market_state_stale_reason(market_state) is not None:
+            logger.warning(
+                "trading_halted_stale_price",
+                symbol=symbol,
+                age_sec=None if market_state is None else round(self._market_state_age_sec(market_state), 2),
+                stale_threshold_sec=self._settings.stale_threshold_sec,
+            )
             return None
 
         exit_price = self._exit_fill_price(position, trigger_price)
@@ -608,21 +622,9 @@ class PaperExecutor:
         return _money(market_state.bid * (1 - slippage))
 
     def _market_state_fill_rejection_reason(self, market_state: MarketState) -> str | None:
-        now = datetime.now(tz=UTC)
-        market_timestamp = (
-            market_state.timestamp
-            if market_state.timestamp.tzinfo
-            else market_state.timestamp.replace(tzinfo=UTC)
-        )
-        market_age_sec = abs((now - market_timestamp).total_seconds())
-        if market_age_sec > MAX_FILL_MARKET_AGE_SECONDS:
-            logger.warning(
-                "paper_fill_rejected_stale_market",
-                symbol=market_state.symbol,
-                market_age_sec=round(market_age_sec, 2),
-                max_age_sec=MAX_FILL_MARKET_AGE_SECONDS,
-            )
-            return "stale_market"
+        stale_reason = self._market_state_stale_reason(market_state)
+        if stale_reason is not None:
+            return stale_reason
         if market_state.bid <= 0 or market_state.ask <= 0:
             logger.warning(
                 "paper_fill_rejected_invalid_market",
@@ -644,6 +646,33 @@ class PaperExecutor:
             )
             return "spread_too_wide"
         return None
+
+    def _market_state_stale_reason(self, market_state: MarketState) -> str | None:
+        market_age_sec = self._market_state_age_sec(market_state)
+        if market_age_sec > self._settings.stale_threshold_sec:
+            logger.warning(
+                "trading_halted_stale_price",
+                symbol=market_state.symbol,
+                age_sec=round(market_age_sec, 2),
+                stale_threshold_sec=self._settings.stale_threshold_sec,
+            )
+            logger.warning(
+                "paper_fill_rejected_stale_market",
+                symbol=market_state.symbol,
+                market_age_sec=round(market_age_sec, 2),
+                max_age_sec=self._settings.stale_threshold_sec,
+            )
+            return "stale_market"
+        return None
+
+    def _market_state_age_sec(self, market_state: MarketState) -> float:
+        now = datetime.now(tz=UTC)
+        market_timestamp = (
+            market_state.timestamp
+            if market_state.timestamp.tzinfo
+            else market_state.timestamp.replace(tzinfo=UTC)
+        )
+        return max(0.0, (now - market_timestamp).total_seconds())
 
     def _exit_fill_price(self, position: PaperPosition, trigger_price: float) -> float:
         slippage = self._settings.paper_slippage_bps / 10_000

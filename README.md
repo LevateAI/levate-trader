@@ -81,6 +81,9 @@ Defaults to `true`.
 `SCALP_COOLDOWN_SECONDS`: per-symbol scalp cooldown after a signal. Defaults to
 `600`.
 
+`STALE_THRESHOLD_SEC`: max allowed age for websocket-derived prices before the
+bot reconnects, halts trading, and skips stale market writes. Defaults to `20`.
+
 `CHAOS_MODE`: when `true`, wraps enabled strategies with randomized signal
 skipping and sizing for the `chaos` tournament account.
 

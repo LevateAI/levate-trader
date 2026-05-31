@@ -163,6 +163,28 @@ class SupabaseRepository:
             return None
         return dict(response.data[0]["value"])
 
+    async def delete_older_than(self, table: str, column: str, cutoff_iso: str) -> int:
+        """Delete rows older than a cutoff and return the reported deletion count."""
+        logger.info(
+            "supabase_delete_older_than",
+            table=table,
+            column=column,
+            cutoff_iso=cutoff_iso,
+        )
+
+        def _delete_older_than_sync() -> Any:
+            return (
+                self._client.table(table)
+                .delete(count="exact")
+                .lt(column, cutoff_iso)
+                .execute()
+            )
+
+        response = await asyncio.to_thread(_delete_older_than_sync)
+        if response.count is not None:
+            return int(response.count)
+        return len(response.data or [])
+
     def _insert_sync(self, table: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         self._validate_account_payload(table, payload)
         response = self._client.table(table).insert(payload).execute()

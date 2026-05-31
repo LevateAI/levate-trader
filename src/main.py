@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -24,6 +25,7 @@ from src.strategies.chaos_wrapper import ChaosStrategyWrapper
 from src.strategies.scalp_common import SCALP_STRATEGY_NAMES
 
 logger = structlog.get_logger(__name__)
+STALE_LOG_THROTTLE_SEC = 30
 
 
 class TraderRuntime:
@@ -58,6 +60,8 @@ class TraderRuntime:
         self._latest_market: dict[str, MarketState] = {}
         self._last_market_state = self._latest_market
         self._pending_trade_events: dict[str, list[dict[str, Any]]] = {}
+        self._last_market_write_source_timestamp: dict[str, datetime] = {}
+        self._throttled_log_at: dict[str, float] = {}
         self._http_calls_this_minute = 0
 
     async def run(self) -> None:
@@ -80,7 +84,14 @@ class TraderRuntime:
             asyncio.create_task(self._strategy_loop(strategies), name="strategy-loop"),
             asyncio.create_task(self._market_snapshot_loop(), name="market-snapshot-loop"),
             asyncio.create_task(self._snapshot_loop(), name="snapshot-loop"),
-            asyncio.create_task(self.exchange.watchdog_loop(), name="hyperliquid-ws-watchdog"),
+            asyncio.create_task(self._market_data_prune_loop(), name="market-data-prune-loop"),
+            asyncio.create_task(
+                self.exchange.watchdog_loop(
+                    stale_threshold_sec=self.settings.stale_threshold_sec,
+                    check_interval_sec=5,
+                ),
+                name="hyperliquid-ws-watchdog",
+            ),
         ]
         await self.stop_event.wait()
         logger.info("runtime_shutdown_started")
@@ -123,6 +134,8 @@ class TraderRuntime:
                     latest_market = self._market_cache().get(symbol)
                     if latest_market is None:
                         continue
+                    if not self._price_is_fresh(latest_market):
+                        continue
                     market_state = await self._build_strategy_market_state(symbol, latest_market)
                     if self.settings.execution_mode == "paper_sim":
                         await self.executor.update_market_state(market_state)
@@ -148,12 +161,38 @@ class TraderRuntime:
                 self._safe_send_sms_error(exc)
             await asyncio.sleep(5)
 
+    async def _market_data_prune_loop(self) -> None:
+        while True:
+            try:
+                if self.settings.market_data_writer:
+                    cutoff = datetime.now(tz=UTC) - timedelta(hours=24)
+                    deleted_count = await self.repository.delete_older_than(
+                        "market_data_snapshots",
+                        "created_at",
+                        cutoff.isoformat(),
+                    )
+                    logger.info(
+                        "market_data_snapshots_pruned",
+                        deleted_count=deleted_count,
+                        cutoff_iso=cutoff.isoformat(),
+                    )
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                logger.error(
+                    "market_data_prune_loop_error",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                self._safe_send_sms_error(exc)
+            await asyncio.sleep(6 * 60 * 60)
+
     async def _run_strategies_for_symbol(
         self,
         symbol: str,
         market_state: MarketState,
         strategies: list[Strategy],
     ) -> None:
+        if not self._price_is_fresh(market_state):
+            return
         for strategy in strategies:
             if symbol not in strategy.symbols:
                 continue
@@ -171,6 +210,9 @@ class TraderRuntime:
     async def _snapshot_loop(self) -> None:
         while True:
             try:
+                if not self._all_prices_fresh():
+                    await asyncio.sleep(60)
+                    continue
                 snapshot = await self._build_equity_snapshot()
                 await self.repository.insert(
                     "equity_snapshots",
@@ -317,6 +359,14 @@ class TraderRuntime:
         return self._latest_market
 
     async def _write_market_snapshot(self, market_state: MarketState) -> None:
+        last_written = self._last_market_write_source_timestamp.get(market_state.symbol)
+        if last_written == market_state.timestamp:
+            self._log_throttled(
+                f"market_write_skipped_stale:{market_state.symbol}",
+                "market_write_skipped_stale",
+                symbol=market_state.symbol,
+            )
+            return
         payload = {
             "account_id": self.settings.account_id,
             "timestamp": market_state.timestamp.isoformat(),
@@ -338,6 +388,7 @@ class TraderRuntime:
             ),
         }
         await self.repository.insert("market_data_snapshots", payload)
+        self._last_market_write_source_timestamp[market_state.symbol] = market_state.timestamp
 
     async def _build_equity_snapshot(self) -> EquitySnapshot:
         if self.settings.execution_mode == "paper_sim":
@@ -440,6 +491,48 @@ class TraderRuntime:
     def _log_http_calls_per_minute(self) -> None:
         logger.info("http_calls_per_minute", count=self._http_calls_this_minute)
         self._http_calls_this_minute = 0
+
+    def _price_is_fresh(self, market_state: MarketState) -> bool:
+        age_sec = self._market_age_sec(market_state)
+        if age_sec <= self.settings.stale_threshold_sec:
+            return True
+        self._log_throttled(
+            f"trading_halted_stale_price:{market_state.symbol}",
+            "trading_halted_stale_price",
+            symbol=market_state.symbol,
+            age_sec=round(age_sec, 2),
+            stale_threshold_sec=self.settings.stale_threshold_sec,
+        )
+        return False
+
+    def _all_prices_fresh(self) -> bool:
+        market_states = list(self._market_cache().values())
+        if not market_states:
+            self._log_throttled(
+                "trading_halted_stale_price:no_market_data",
+                "trading_halted_stale_price",
+                symbol="all",
+                age_sec=None,
+                stale_threshold_sec=self.settings.stale_threshold_sec,
+            )
+            return False
+        return all(self._price_is_fresh(market_state) for market_state in market_states)
+
+    def _market_age_sec(self, market_state: MarketState) -> float:
+        timestamp = (
+            market_state.timestamp
+            if market_state.timestamp.tzinfo is not None
+            else market_state.timestamp.replace(tzinfo=UTC)
+        )
+        return max(0.0, (datetime.now(tz=UTC) - timestamp).total_seconds())
+
+    def _log_throttled(self, key: str, event: str, **fields: Any) -> None:
+        now = time.monotonic()
+        last_logged_at = self._throttled_log_at.get(key, 0.0)
+        if now - last_logged_at < STALE_LOG_THROTTLE_SEC:
+            return
+        logger.warning(event, **fields)
+        self._throttled_log_at[key] = now
 
     async def _realized_daily_vol(self, symbol: str) -> float:
         bars = await self._fetch_recent_bars(symbol, count=288)

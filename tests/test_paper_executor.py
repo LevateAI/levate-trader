@@ -165,7 +165,7 @@ async def test_paper_market_sell_fills_at_bid_minus_slippage() -> None:
 @pytest.mark.asyncio
 async def test_rejects_fill_on_stale_market() -> None:
     executor = _executor()
-    stale_timestamp = datetime.now(tz=UTC) - timedelta(seconds=11)
+    stale_timestamp = datetime.now(tz=UTC) - timedelta(seconds=21)
     await executor.update_market_state(
         _market(bid=99, ask=100, last=99.5, timestamp=stale_timestamp)
     )

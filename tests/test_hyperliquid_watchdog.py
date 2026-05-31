@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import UTC, datetime, timedelta
+import time
 
 import pytest
 
@@ -10,16 +11,24 @@ from src.exchange.hyperliquid_client import HyperliquidClient
 
 
 @pytest.mark.asyncio
-async def test_watchdog_reconnects_once_and_keeps_running() -> None:
+async def test_watchdog_reconnects_once_and_keeps_running(monkeypatch: pytest.MonkeyPatch) -> None:
     client = object.__new__(HyperliquidClient)
     client._last_event_at = datetime.now(tz=UTC) - timedelta(seconds=35)
+    client._last_message_at = time.monotonic() - 35
     reconnect_calls = 0
     reconnected = asyncio.Event()
+    warning_events: list[str] = []
+
+    def capture_warning(event: str, **_: object) -> None:
+        warning_events.append(event)
+
+    monkeypatch.setattr("src.exchange.hyperliquid_client.logger.warning", capture_warning)
 
     async def fake_reconnect() -> None:
         nonlocal reconnect_calls
         reconnect_calls += 1
         client._last_event_at = datetime.now(tz=UTC)
+        client._last_message_at = time.monotonic()
         reconnected.set()
 
     client.reconnect_with_backoff = fake_reconnect  # type: ignore[method-assign]
@@ -32,6 +41,7 @@ async def test_watchdog_reconnects_once_and_keeps_running() -> None:
         await asyncio.sleep(0.03)
 
         assert reconnect_calls == 1
+        assert "ws_stale_detected" in warning_events
         assert not task.done()
     finally:
         task.cancel()
@@ -44,6 +54,7 @@ def _queue_full_client() -> HyperliquidClient:
     client.market_events = asyncio.Queue(maxsize=1)
     client.market_events.put_nowait({"channel": "book", "symbol": "BTC-PERP", "payload": {}})
     client._last_event_at = datetime.now(tz=UTC)
+    client._last_message_at = time.monotonic()
     client.dropped_event_counter = 0
     client._drop_timestamps = deque()
     client._force_reconnect_due_to_drops = False

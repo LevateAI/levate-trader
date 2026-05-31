@@ -16,12 +16,29 @@ from src.models import BTC_PERP
 class DummyExecutor:
     paper_equity_usd: float = 1000.0
     update_market_state_calls: int = 0
+    execute_signal_calls: int = 0
 
     async def get_open_positions(self) -> list[Any]:
         return []
 
     async def update_market_state(self, _: Any) -> None:
         self.update_market_state_calls += 1
+
+    async def execute_signal(self, *_: Any) -> dict[str, Any]:
+        self.execute_signal_calls += 1
+        return {"status": "filled"}
+
+
+@dataclass
+class DummyRepository:
+    inserts: dict[str, list[dict[str, Any]]]
+
+    async def insert(self, table: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.inserts.setdefault(table, []).append(payload)
+        return payload
+
+    async def delete_older_than(self, table: str, column: str, cutoff_iso: str) -> int:
+        return 0
 
 
 class DummyExchange:
@@ -50,11 +67,14 @@ def _runtime() -> tuple[TraderRuntime, DummyExchange]:
     )
     runtime.exchange = exchange
     runtime.executor = DummyExecutor()
+    runtime.repository = DummyRepository({})
     runtime._bars_5m = {}
     runtime._bars_last_fetch = {}
     runtime._last_market_state = {}
     runtime._latest_market = runtime._last_market_state
     runtime._pending_trade_events = {}
+    runtime._last_market_write_source_timestamp = {}
+    runtime._throttled_log_at = {}
     runtime._http_calls_this_minute = 0
     return runtime, exchange
 
@@ -188,3 +208,65 @@ async def test_queue_decouple_consumer() -> None:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_market_writer_skips_insert_when_source_timestamp_unchanged() -> None:
+    runtime, _ = _runtime()
+    timestamp = datetime.now(tz=UTC)
+    market_state = runtime._market_state_from_parsed(
+        symbol=BTC_PERP,
+        parsed={"bid": 99, "ask": 101, "mid": 100, "last_trade_price": 100},
+        bars_5m=[],
+        trade_events=[],
+        equity=None,
+        positions=[],
+    )
+    market_state.timestamp = timestamp
+
+    await runtime._write_market_snapshot(market_state)
+    await runtime._write_market_snapshot(market_state)
+
+    assert len(runtime.repository.inserts["market_data_snapshots"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_bot_halts_trading_when_price_stale_and_resumes_when_fresh() -> None:
+    runtime, _ = _runtime()
+
+    class AlwaysSignal:
+        name = "always_signal"
+        symbols = [BTC_PERP]
+
+        async def on_tick(self, _: dict[str, Any]) -> Any:
+            from src.models import Side, Signal
+
+            return Signal(
+                side=Side.LONG,
+                symbol=BTC_PERP,
+                size_pct_equity=0.1,
+                entry_price=100,
+                stop_loss=99,
+                take_profit=102,
+                reasoning="test",
+                strategy_name=self.name,
+            )
+
+    stale_market = runtime._market_state_from_parsed(
+        symbol=BTC_PERP,
+        parsed={"bid": 99, "ask": 101, "mid": 100, "last_trade_price": 100},
+        bars_5m=[],
+        trade_events=[],
+        equity=1000,
+        positions=[],
+    )
+    stale_market.timestamp = datetime.now(tz=UTC) - timedelta(seconds=21)
+
+    await runtime._run_strategies_for_symbol(BTC_PERP, stale_market, [AlwaysSignal()])
+
+    assert runtime.executor.execute_signal_calls == 0
+
+    fresh_market = stale_market.model_copy(update={"timestamp": datetime.now(tz=UTC)})
+    await runtime._run_strategies_for_symbol(BTC_PERP, fresh_market, [AlwaysSignal()])
+
+    assert runtime.executor.execute_signal_calls == 1
