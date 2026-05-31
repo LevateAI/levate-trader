@@ -29,6 +29,11 @@ python -m src.main
 `EXECUTION_MODE`: one of `paper_sim`, `testnet_real`, or `mainnet_real`.
 Defaults to `paper_sim`.
 
+`ACCOUNT_ID`: tournament account namespace. Defaults to `balanced`.
+
+`PERSONALITY`: human-readable bot personality/config profile. Defaults to
+`balanced`.
+
 `HYPERLIQUID_PRIVATE_KEY`: API wallet private key. Optional in `paper_sim`;
 required in `testnet_real`.
 
@@ -52,6 +57,12 @@ key.
 `MAX_DAILY_LOSS_PCT`, `MAX_WEEKLY_LOSS_PCT`, `MAX_DRAWDOWN_PCT`: hard breaker
 thresholds as whole percentages. Defaults are `5`, `10`, and `20`.
 
+`MAX_POSITION_SIZE_PCT`: hard cap for signal sizing as a whole percentage of
+equity. Defaults to `10`.
+
+`LEVERAGE_CAP`: maximum notional exposure multiple used by the position sizer.
+Defaults to `15`.
+
 `STRATEGIES_ENABLED`: comma-separated strategy names. For the scalp suite use
 `micro_rsi_scalp,book_imbalance,volume_fade,rsi_mean_reversion,cme_gap_fill`.
 
@@ -69,6 +80,13 @@ Defaults to `true`.
 
 `SCALP_COOLDOWN_SECONDS`: per-symbol scalp cooldown after a signal. Defaults to
 `600`.
+
+`CHAOS_MODE`: when `true`, wraps enabled strategies with randomized signal
+skipping and sizing for the `chaos` tournament account.
+
+`MARKET_DATA_WRITER`: when `true`, this bot writes shared
+`market_data_snapshots`. In tournament mode, only one instance should set this
+to `true`.
 
 `CLOSE_POSITIONS_ON_SHUTDOWN`: reserved safety toggle for future shutdown
 behavior.
@@ -93,6 +111,46 @@ the bot:
 
 1. `supabase/migrations/001_initial_schema.sql`
 2. `supabase/migrations/002_add_execution_mode.sql`
+3. `supabase/migrations/003_tournament_mode.sql`
+
+## Tournament Mode
+
+Tournament mode runs six isolated paper accounts against the same Hyperliquid
+public market feed. Each account writes to the shared Supabase database with its
+own `account_id`, so trades, positions, equity snapshots, strategy signals,
+circuit breakers, and bot state do not leak across competitors.
+
+The bundled personalities are:
+
+- `conservative`: CME gap plus RSI mean reversion with tight risk limits.
+- `balanced`: the default mixed strategy set and the only market-data writer.
+- `aggressive`: mixed strategies with wider risk and leverage settings.
+- `scalp_only`: micro RSI, book imbalance, and volume fade only.
+- `swing_only`: CME gap plus RSI with moderate swing risk.
+- `chaos`: mixed strategies with randomized signal skipping and sizing.
+
+Template env files live under `envs/`. Fill `SUPABASE_URL` and
+`SUPABASE_SERVICE_KEY` in each account file before starting services. All
+tournament templates default to `EXECUTION_MODE=paper_sim`,
+`STARTING_BALANCE_USD=1000`, and `SMS_ALERTS_ENABLED=false`.
+
+Install the systemd template, then start one bot:
+
+```bash
+sudo systemctl start levate-trader@conservative
+sudo journalctl -u levate-trader@conservative -f
+```
+
+Start all six:
+
+```bash
+for bot in conservative balanced aggressive scalp_only swing_only chaos; do
+  sudo systemctl start "levate-trader@${bot}"
+done
+```
+
+Each unit reads `/home/levateai/levate-trader/envs/%i.env` and sets
+`ACCOUNT_ID=%i`.
 
 ## Funding Hyperliquid Testnet
 
@@ -149,18 +207,19 @@ export REPO_URL=git@github.com:YOUR_ORG/YOUR_REPO.git
 bash scripts/setup_droplet.sh
 ```
 
-Then fill `/opt/levate-trader/.env` and start:
+Then fill the account env files under `/home/levateai/levate-trader/envs/` and
+start one or more tournament services:
 
 ```bash
-sudo systemctl start levate-trader
-sudo journalctl -u levate-trader -f
+sudo systemctl start levate-trader@balanced
+sudo journalctl -u levate-trader@balanced -f
 ```
 
 For normal deploys from your laptop:
 
 ```bash
 export DROPLET_HOST=your.droplet.ip
-export DROPLET_USER=levatetrader
+export DROPLET_USER=levateai
 bash scripts/deploy.sh
 ```
 

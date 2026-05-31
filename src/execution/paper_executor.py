@@ -114,6 +114,7 @@ class PaperExecutor:
             filters={
                 "status": TradeStatus.OPEN.value,
                 "execution_mode": self._settings.execution_mode,
+                "account_id": self._settings.account_id,
             },
             limit=1000,
             order_column="timestamp",
@@ -121,7 +122,10 @@ class PaperExecutor:
         )
         latest_snapshot_rows = await self._repository.select_where(
             "equity_snapshots",
-            filters={"execution_mode": self._settings.execution_mode},
+            filters={
+                "execution_mode": self._settings.execution_mode,
+                "account_id": self._settings.account_id,
+            },
             limit=1,
             order_column="timestamp",
             desc=True,
@@ -136,6 +140,7 @@ class PaperExecutor:
                 filters={
                     "id": str(trade.id),
                     "execution_mode": self._settings.execution_mode,
+                    "account_id": self._settings.account_id,
                 },
                 limit=1,
                 order_column="timestamp",
@@ -207,9 +212,11 @@ class PaperExecutor:
             equity=equity,
             signal_confidence=signal.confidence,
             asset_realized_vol=asset_realized_vol,
+            leverage_cap=self._settings.leverage_cap,
             stop_distance=signal.stop_distance_pct,
         )
-        requested_notional = signal.size_pct_equity * equity
+        max_position_fraction = self._settings.max_position_size_pct / 100
+        requested_notional = min(signal.size_pct_equity, max_position_fraction) * equity
         usd_notional = min(usd_notional, requested_notional)
         if usd_notional <= 0:
             await self._log_strategy_signal(signal, action_taken="rejected_zero_size")
@@ -443,6 +450,7 @@ class PaperExecutor:
 
         self.paper_balance_usd = _money(self.paper_balance_usd - fee)
         trade = Trade(
+            account_id=self._settings.account_id,
             strategy_name=signal.strategy_name if signal else "manual_paper",
             symbol=symbol,
             side=position_side,
@@ -462,7 +470,7 @@ class PaperExecutor:
             size=size,
             entry_price=_money(fill_price),
             entry_time=trade.timestamp,
-            leverage=10,
+            leverage=self._settings.leverage_cap,
             stop_loss=signal.stop_loss if signal else None,
             take_profit=signal.take_profit if signal else None,
             strategy_name=trade.strategy_name,
@@ -646,6 +654,7 @@ class PaperExecutor:
     async def _log_strategy_signal(self, signal: Signal, action_taken: str) -> None:
         payload = {
             "timestamp": signal.created_at.isoformat(),
+            "account_id": self._settings.account_id,
             "strategy_name": signal.strategy_name,
             "symbol": signal.symbol,
             "signal_type": "exit" if signal.reduce_only else "entry",
@@ -658,6 +667,7 @@ class PaperExecutor:
 
     def _trade_payload(self, trade: Trade) -> dict[str, Any]:
         payload = trade.model_dump(mode="json")
+        payload["account_id"] = self._settings.account_id
         payload["execution_mode"] = self._settings.execution_mode
         for key in ("entry_price", "exit_price", "pnl_usd", "fees_usd"):
             if payload.get(key) is not None:
@@ -667,6 +677,7 @@ class PaperExecutor:
     def _position_payload(self, trade_id: UUID, position: PaperPosition) -> dict[str, Any]:
         return {
             "id": str(trade_id),
+            "account_id": self._settings.account_id,
             "timestamp": position.entry_time.isoformat(),
             "symbol": position.symbol,
             "side": position.side.value,
@@ -685,6 +696,7 @@ class PaperExecutor:
         payload = dict(trade_row)
         payload.pop("created_at", None)
         payload.pop("execution_mode", None)
+        payload["account_id"] = self._settings.account_id
         payload["reason_entry"] = payload.get("reason_entry") or "restored paper trade"
         payload["fees_usd"] = float(payload.get("fees_usd") or 0)
         return Trade(**payload)

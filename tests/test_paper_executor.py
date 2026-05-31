@@ -361,9 +361,10 @@ async def test_paper_restore_state_rehydrates_open_trade_and_position() -> None:
     repository = DummyRepository(
         rows={
             "trades": [
-                {
-                    "id": trade_id,
-                    "timestamp": timestamp,
+                    {
+                        "id": trade_id,
+                        "account_id": "balanced",
+                        "timestamp": timestamp,
                     "strategy_name": "rsi_mean_reversion",
                     "symbol": BTC_PERP,
                     "side": "long",
@@ -383,9 +384,10 @@ async def test_paper_restore_state_rehydrates_open_trade_and_position() -> None:
                 }
             ],
             "positions": [
-                {
-                    "id": trade_id,
-                    "timestamp": timestamp,
+                    {
+                        "id": trade_id,
+                        "account_id": "balanced",
+                        "timestamp": timestamp,
                     "symbol": BTC_PERP,
                     "side": "long",
                     "size": 1,
@@ -400,8 +402,9 @@ async def test_paper_restore_state_rehydrates_open_trade_and_position() -> None:
                 }
             ],
             "equity_snapshots": [
-                {
-                    "timestamp": timestamp,
+                    {
+                        "account_id": "balanced",
+                        "timestamp": timestamp,
                     "balance_usd": 999.95,
                     "equity_usd": 1002.45,
                     "execution_mode": "paper_sim",

@@ -81,6 +81,7 @@ class Position(BaseModel):
     """Open position record."""
 
     id: UUID = Field(default_factory=uuid4)
+    account_id: str = "balanced"
     timestamp: datetime = Field(default_factory=utc_now)
     symbol: str
     side: Side
@@ -98,6 +99,7 @@ class Trade(BaseModel):
     """Trade row model."""
 
     id: UUID = Field(default_factory=uuid4)
+    account_id: str = "balanced"
     timestamp: datetime = Field(default_factory=utc_now)
     strategy_name: str
     symbol: str
@@ -118,6 +120,7 @@ class Trade(BaseModel):
 class EquitySnapshot(BaseModel):
     """Account equity snapshot."""
 
+    account_id: str = "balanced"
     timestamp: datetime = Field(default_factory=utc_now)
     execution_mode: str = "paper_sim"
     balance_usd: float
@@ -132,6 +135,7 @@ class EquitySnapshot(BaseModel):
 class CircuitBreakerEvent(BaseModel):
     """Persisted circuit breaker event."""
 
+    account_id: str = "balanced"
     timestamp: datetime = Field(default_factory=utc_now)
     breaker_type: str
     threshold_value: float

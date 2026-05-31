@@ -38,6 +38,9 @@ class Executor:
         self._discord = discord
         self._sms = sms
         self._execution_mode = settings.execution_mode if settings else "testnet_real"
+        self._account_id = settings.account_id if settings else "balanced"
+        self._leverage_cap = settings.leverage_cap if settings else 10.0
+        self._max_position_size_pct = settings.max_position_size_pct if settings else 10.0
         self._open_trades: dict[str, Trade] = {}
 
     async def execute_signal(
@@ -76,9 +79,10 @@ class Executor:
             equity=equity,
             signal_confidence=signal.confidence,
             asset_realized_vol=asset_realized_vol,
+            leverage_cap=self._leverage_cap,
             stop_distance=signal.stop_distance_pct,
         )
-        requested_notional = signal.size_pct_equity * equity
+        requested_notional = min(signal.size_pct_equity, self._max_position_size_pct / 100) * equity
         usd_notional = min(usd_notional, requested_notional)
         if usd_notional <= 0:
             logger.warning("signal_rejected_zero_size", symbol=signal.symbol)
@@ -124,6 +128,7 @@ class Executor:
         size = float(fill.get("sz") or fill.get("size") or 0)
         entry_price = float(fill.get("px") or fill.get("price") or signal.entry_price)
         trade = Trade(
+            account_id=self._account_id,
             strategy_name=signal.strategy_name,
             symbol=signal.symbol,
             side=signal.side,
@@ -133,11 +138,12 @@ class Executor:
         )
         position = Position(
             id=trade.id,
+            account_id=self._account_id,
             symbol=signal.symbol,
             side=signal.side,
             size=size,
             entry_price=entry_price,
-            leverage=10,
+            leverage=self._leverage_cap,
             strategy_name=signal.strategy_name,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
@@ -145,8 +151,10 @@ class Executor:
         self._open_trades[str(trade.id)] = trade
 
         trade_payload = _trade_payload(trade)
+        trade_payload["account_id"] = self._account_id
         trade_payload["execution_mode"] = self._execution_mode
         position_payload = position.model_dump(mode="json")
+        position_payload["account_id"] = self._account_id
         position_payload["execution_mode"] = self._execution_mode
         if self._repository is not None:
             await self._repository.insert("trades", trade_payload)
@@ -195,6 +203,7 @@ class Executor:
         trade.status = TradeStatus.CLOSED
 
         payload = _trade_payload(trade)
+        payload["account_id"] = self._account_id
         payload["execution_mode"] = self._execution_mode
         if self._repository is not None:
             await self._repository.update("trades", str(trade.id), payload)
@@ -216,6 +225,7 @@ class Executor:
     async def _log_strategy_signal(self, signal: Signal, action_taken: str) -> None:
         payload = {
             "timestamp": signal.created_at.isoformat(),
+            "account_id": self._account_id,
             "strategy_name": signal.strategy_name,
             "symbol": signal.symbol,
             "signal_type": "exit" if signal.reduce_only else "entry",

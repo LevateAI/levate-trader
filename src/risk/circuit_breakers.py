@@ -144,6 +144,7 @@ class CircuitBreakerManager:
             reason=breaker_type,
         )
         event = CircuitBreakerEvent(
+            account_id=self._settings.account_id,
             breaker_type=breaker_type,
             threshold_value=threshold_value,
             observed_value=observed_value,

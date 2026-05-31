@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
+from pathlib import Path
 from typing import Literal
 
 from pydantic import AnyUrl, Field, field_validator, model_validator
@@ -15,16 +17,29 @@ MAINNET_REAL_DISABLED_MESSAGE = (
 )
 
 
+def _settings_env_file() -> str:
+    """Resolve the default env file for a single tournament account."""
+    account_id = os.getenv("ACCOUNT_ID")
+    if not account_id:
+        return ".env"
+    envs_path = Path("envs") / f"{account_id}.env"
+    if envs_path.exists():
+        return str(envs_path)
+    return f"{account_id}.env"
+
+
 class Settings(BaseSettings):
     """Application settings loaded from `.env` and process environment."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_settings_env_file(),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
     )
 
+    account_id: str = "balanced"
+    personality: str = "balanced"
     execution_mode: ExecutionMode = "paper_sim"
     hyperliquid_private_key: str | None = Field(default=None, min_length=1)
     hyperliquid_account_address: str | None = Field(default=None, min_length=1)
@@ -43,6 +58,8 @@ class Settings(BaseSettings):
     max_daily_loss_pct: float = 5.0
     max_weekly_loss_pct: float = 10.0
     max_drawdown_pct: float = 20.0
+    max_position_size_pct: float = 10.0
+    leverage_cap: float = 15.0
 
     strategies_enabled: str = "cme_gap_fill,rsi_mean_reversion"
     starting_balance_usd: float = 1000.0
@@ -51,15 +68,23 @@ class Settings(BaseSettings):
     scalp_mode_enabled: bool = True
     scalp_max_hold_minutes: int = 15
     scalp_cooldown_seconds: int = 600
+    chaos_mode: bool = False
+    market_data_writer: bool = True
     close_positions_on_shutdown: bool = False
     log_level: str = "INFO"
 
-    @field_validator("max_daily_loss_pct", "max_weekly_loss_pct", "max_drawdown_pct")
+    @field_validator(
+        "max_daily_loss_pct",
+        "max_weekly_loss_pct",
+        "max_drawdown_pct",
+        "max_position_size_pct",
+        "leverage_cap",
+    )
     @classmethod
-    def validate_pct(cls, value: float) -> float:
-        """Validate that configured risk percentages are positive."""
+    def validate_positive_risk_values(cls, value: float) -> float:
+        """Validate that configured risk and leverage values are positive."""
         if value <= 0:
-            raise ValueError("risk percentages must be positive")
+            raise ValueError("risk and leverage values must be positive")
         return value
 
     @field_validator("scalp_max_hold_minutes", "scalp_cooldown_seconds")

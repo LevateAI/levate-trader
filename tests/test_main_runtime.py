@@ -15,9 +15,13 @@ from src.models import BTC_PERP
 @dataclass
 class DummyExecutor:
     paper_equity_usd: float = 1000.0
+    update_market_state_calls: int = 0
 
     async def get_open_positions(self) -> list[Any]:
         return []
+
+    async def update_market_state(self, _: Any) -> None:
+        self.update_market_state_calls += 1
 
 
 class DummyExchange:
@@ -49,6 +53,8 @@ def _runtime() -> tuple[TraderRuntime, DummyExchange]:
     runtime._bars_5m = {}
     runtime._bars_last_fetch = {}
     runtime._last_market_state = {}
+    runtime._latest_market = runtime._last_market_state
+    runtime._pending_trade_events = {}
     runtime._http_calls_this_minute = 0
     return runtime, exchange
 
@@ -145,6 +151,39 @@ async def test_market_loop_sms_failure_does_not_crash_loop() -> None:
 
         assert send_error_calls == 1
         assert not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_queue_decouple_consumer() -> None:
+    runtime, exchange = _runtime()
+    event = {
+        "channel": "book",
+        "symbol": BTC_PERP,
+        "payload": {
+            "data": {
+                "levels": [
+                    [{"px": "99999", "sz": "1"}],
+                    [{"px": "100001", "sz": "1"}],
+                ]
+            }
+        },
+    }
+
+    task = asyncio.create_task(runtime._market_loop([]))
+    try:
+        for _ in range(5000):
+            await exchange.market_events.put(event)
+
+        assert not exchange.market_events.full()
+        await asyncio.wait_for(exchange.market_events.join(), timeout=1)
+
+        assert exchange.get_candles_calls == 0
+        assert runtime._http_calls_this_minute == 0
+        assert runtime._latest_market[BTC_PERP].mid == pytest.approx(100000)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

@@ -20,6 +20,7 @@ from src.logging import configure_logging
 from src.models import BTC_PERP, ETH_PERP, EquitySnapshot, MarketState
 from src.risk.circuit_breakers import CircuitBreakerManager
 from src.strategies import STRATEGY_REGISTRY, Strategy
+from src.strategies.chaos_wrapper import ChaosStrategyWrapper
 from src.strategies.scalp_common import SCALP_STRATEGY_NAMES
 
 logger = structlog.get_logger(__name__)
@@ -54,7 +55,9 @@ class TraderRuntime:
         self.high_water_equity = self.settings.starting_balance_usd
         self._bars_5m: dict[str, list[dict[str, Any]]] = {}
         self._bars_last_fetch: dict[str, datetime] = {}
-        self._last_market_state: dict[str, MarketState] = {}
+        self._latest_market: dict[str, MarketState] = {}
+        self._last_market_state = self._latest_market
+        self._pending_trade_events: dict[str, list[dict[str, Any]]] = {}
         self._http_calls_this_minute = 0
 
     async def run(self) -> None:
@@ -74,6 +77,8 @@ class TraderRuntime:
 
         tasks = [
             asyncio.create_task(self._market_loop(strategies), name="market-loop"),
+            asyncio.create_task(self._strategy_loop(strategies), name="strategy-loop"),
+            asyncio.create_task(self._market_snapshot_loop(), name="market-snapshot-loop"),
             asyncio.create_task(self._snapshot_loop(), name="snapshot-loop"),
             asyncio.create_task(self.exchange.watchdog_loop(), name="hyperliquid-ws-watchdog"),
         ]
@@ -90,6 +95,7 @@ class TraderRuntime:
 
     async def _market_loop(self, strategies: list[Strategy]) -> None:
         while True:
+            event: dict[str, Any] | None = None
             try:
                 event = await self.exchange.market_events.get()
                 if event["channel"] == "user_fills":
@@ -98,33 +104,78 @@ class TraderRuntime:
                 symbol = event.get("symbol")
                 if symbol not in {BTC_PERP, ETH_PERP}:
                     continue
-                market_state = await self._build_market_state(symbol, event)
+                market_state = self._ingest_market_event(symbol, event)
                 if self.settings.execution_mode == "paper_sim":
                     await self.executor.update_market_state(market_state)
-                await self._write_market_snapshot(market_state)
-                for strategy in strategies:
-                    if symbol not in strategy.symbols:
-                        continue
-                    signal_result = await strategy.on_tick(market_state.model_dump())
-                    if signal_result is None:
-                        continue
-                    equity = (
-                        self.executor.paper_equity_usd
-                        if self.settings.execution_mode == "paper_sim"
-                        else market_state.equity_usd or self.settings.starting_balance_usd
-                    )
-                    vol = await self._realized_daily_vol(symbol)
-                    await self.executor.execute_signal(signal_result, equity, vol)
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("market_loop_error", error=str(exc), error_type=type(exc).__name__)
                 self._safe_send_sms_error(exc)
                 await asyncio.sleep(1)
+            finally:
+                if event is not None:
+                    self.exchange.market_events.task_done()
+
+    async def _strategy_loop(self, strategies: list[Strategy]) -> None:
+        symbols = sorted({symbol for strategy in strategies for symbol in strategy.symbols})
+        while True:
+            try:
+                for symbol in symbols:
+                    latest_market = self._market_cache().get(symbol)
+                    if latest_market is None:
+                        continue
+                    market_state = await self._build_strategy_market_state(symbol, latest_market)
+                    if self.settings.execution_mode == "paper_sim":
+                        await self.executor.update_market_state(market_state)
+                    await self._run_strategies_for_symbol(symbol, market_state, strategies)
+                    self._pending_trade_events[symbol] = []
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                logger.error("strategy_loop_error", error=str(exc), error_type=type(exc).__name__)
+                self._safe_send_sms_error(exc)
+            await asyncio.sleep(1)
+
+    async def _market_snapshot_loop(self) -> None:
+        while True:
+            try:
+                if self.settings.market_data_writer:
+                    for market_state in list(self._market_cache().values()):
+                        await self._write_market_snapshot(market_state)
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                logger.error(
+                    "market_snapshot_loop_error",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                self._safe_send_sms_error(exc)
+            await asyncio.sleep(5)
+
+    async def _run_strategies_for_symbol(
+        self,
+        symbol: str,
+        market_state: MarketState,
+        strategies: list[Strategy],
+    ) -> None:
+        for strategy in strategies:
+            if symbol not in strategy.symbols:
+                continue
+            signal_result = await strategy.on_tick(market_state.model_dump())
+            if signal_result is None:
+                continue
+            equity = (
+                self.executor.paper_equity_usd
+                if self.settings.execution_mode == "paper_sim"
+                else market_state.equity_usd or self.settings.starting_balance_usd
+            )
+            vol = await self._realized_daily_vol(symbol)
+            await self.executor.execute_signal(signal_result, equity, vol)
 
     async def _snapshot_loop(self) -> None:
         while True:
             try:
                 snapshot = await self._build_equity_snapshot()
-                await self.repository.insert("equity_snapshots", snapshot.model_dump(mode="json"))
+                await self.repository.insert(
+                    "equity_snapshots",
+                    snapshot.model_dump(mode="json") | {"account_id": self.settings.account_id},
+                )
                 breaker_event = await self.circuit_breakers.evaluate(snapshot)
                 if breaker_event and breaker_event.breaker_type in {"weekly_loss", "max_drawdown"}:
                     if self.settings.execution_mode == "paper_sim":
@@ -139,7 +190,90 @@ class TraderRuntime:
 
     async def _build_market_state(self, symbol: str, event: dict[str, Any]) -> MarketState:
         parsed = _parse_market_event(event)
-        previous = self._last_market_state.get(symbol)
+        if self.settings.execution_mode == "paper_sim":
+            equity = self.executor.paper_equity_usd
+            positions = await self.executor.get_open_positions()
+        else:
+            self._record_http_call(2)
+            account_state = await self.exchange.get_account_state()
+            equity = float(account_state.get("marginSummary", {}).get("accountValue") or 0)
+            positions = await self.exchange.get_open_positions()
+        bars = await self._get_bars_5m(symbol, count=60)
+        market_state = self._market_state_from_parsed(
+            symbol=symbol,
+            parsed=parsed,
+            bars_5m=bars,
+            trade_events=list(parsed.get("trade_events") or []),
+            equity=equity,
+            positions=positions,
+        )
+        self._market_cache()[symbol] = market_state
+        return market_state
+
+    def _ingest_market_event(self, symbol: str, event: dict[str, Any]) -> MarketState:
+        """Parse a websocket event into memory without Supabase or HTTP calls."""
+        parsed = _parse_market_event(event)
+        trade_events = list(parsed.get("trade_events") or [])
+        if trade_events:
+            self._pending_trade_events.setdefault(symbol, []).extend(trade_events)
+        market_state = self._market_state_from_parsed(
+            symbol=symbol,
+            parsed=parsed,
+            bars_5m=[],
+            trade_events=[],
+            equity=None,
+            positions=[],
+        )
+        self._market_cache()[symbol] = market_state
+        return market_state
+
+    async def _build_strategy_market_state(
+        self,
+        symbol: str,
+        latest_market: MarketState,
+    ) -> MarketState:
+        """Enrich latest in-memory market data for the slower strategy loop."""
+        if self.settings.execution_mode == "paper_sim":
+            equity = self.executor.paper_equity_usd
+            positions = await self.executor.get_open_positions()
+        else:
+            self._record_http_call(2)
+            account_state = await self.exchange.get_account_state()
+            equity = float(account_state.get("marginSummary", {}).get("accountValue") or 0)
+            positions = await self.exchange.get_open_positions()
+        bars = await self._get_bars_5m(symbol, count=60)
+        market_state = MarketState(
+            symbol=symbol,
+            timestamp=latest_market.timestamp,
+            bid=latest_market.bid,
+            ask=latest_market.ask,
+            mid=latest_market.mid,
+            last_trade_price=latest_market.last_trade_price,
+            volume_24h=latest_market.volume_24h,
+            funding_rate=latest_market.funding_rate,
+            open_interest=latest_market.open_interest,
+            bars_5m=bars,
+            trade_events=list(self._pending_trade_events.get(symbol) or []),
+            bid_levels=latest_market.bid_levels,
+            ask_levels=latest_market.ask_levels,
+            book_bids=list(latest_market.bid_levels or []),
+            book_asks=list(latest_market.ask_levels or []),
+            equity_usd=equity,
+            open_positions=positions,
+        )
+        self._market_cache()[symbol] = market_state
+        return market_state
+
+    def _market_state_from_parsed(
+        self,
+        symbol: str,
+        parsed: dict[str, Any],
+        bars_5m: list[dict[str, Any]],
+        trade_events: list[dict[str, Any]],
+        equity: float | None,
+        positions: list[Any],
+    ) -> MarketState:
+        previous = self._market_cache().get(symbol)
         mid = parsed.get("mid") or parsed.get("last_trade_price")
         if mid is None and previous is not None:
             mid = previous.mid
@@ -152,35 +286,39 @@ class TraderRuntime:
             spread = mid * 0.0002
             bid = mid - spread / 2
             ask = mid + spread / 2
-        if self.settings.execution_mode == "paper_sim":
-            equity = self.executor.paper_equity_usd
-            positions = await self.executor.get_open_positions()
-        else:
-            self._record_http_call(2)
-            account_state = await self.exchange.get_account_state()
-            equity = float(account_state.get("marginSummary", {}).get("accountValue") or 0)
-            positions = await self.exchange.get_open_positions()
-        bars = await self._get_bars_5m(symbol, count=60)
-        market_state = MarketState(
+
+        bid_levels = parsed.get("bid_levels")
+        ask_levels = parsed.get("ask_levels")
+        if bid_levels is None and previous is not None:
+            bid_levels = previous.bid_levels
+        if ask_levels is None and previous is not None:
+            ask_levels = previous.ask_levels
+        return MarketState(
             symbol=symbol,
             bid=float(bid),
             ask=float(ask),
             mid=float(mid),
             last_trade_price=float(parsed.get("last_trade_price") or mid),
-            bars_5m=bars,
-            trade_events=list(parsed.get("trade_events") or []),
-            bid_levels=parsed.get("bid_levels"),
-            ask_levels=parsed.get("ask_levels"),
-            book_bids=list(parsed.get("bid_levels") or []),
-            book_asks=list(parsed.get("ask_levels") or []),
+            bars_5m=bars_5m,
+            trade_events=trade_events,
+            bid_levels=bid_levels,
+            ask_levels=ask_levels,
+            book_bids=list(bid_levels or []),
+            book_asks=list(ask_levels or []),
             equity_usd=equity,
             open_positions=positions,
         )
-        self._last_market_state[symbol] = market_state
-        return market_state
+
+    def _market_cache(self) -> dict[str, MarketState]:
+        """Return the latest-market cache, including manually constructed test runtimes."""
+        if not hasattr(self, "_latest_market"):
+            self._latest_market = getattr(self, "_last_market_state", {})
+            self._last_market_state = self._latest_market
+        return self._latest_market
 
     async def _write_market_snapshot(self, market_state: MarketState) -> None:
         payload = {
+            "account_id": self.settings.account_id,
             "timestamp": market_state.timestamp.isoformat(),
             "symbol": market_state.symbol,
             "bid": round(market_state.bid, 2),
@@ -213,6 +351,7 @@ class TraderRuntime:
                 else 0
             )
             return EquitySnapshot(
+                account_id=self.settings.account_id,
                 execution_mode=self.settings.execution_mode,
                 balance_usd=self.executor.paper_balance_usd,
                 equity_usd=equity,
@@ -239,6 +378,7 @@ class TraderRuntime:
         daily_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=1))
         weekly_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=7))
         return EquitySnapshot(
+            account_id=self.settings.account_id,
             execution_mode=self.settings.execution_mode,
             balance_usd=withdrawable,
             equity_usd=equity,
@@ -254,7 +394,10 @@ class TraderRuntime:
             "equity_snapshots",
             since.isoformat(),
             limit=1,
-            filters={"execution_mode": self.settings.execution_mode},
+            filters={
+                "execution_mode": self.settings.execution_mode,
+                "account_id": self.settings.account_id,
+            },
         )
         if not rows:
             return current_equity - self.settings.starting_balance_usd
@@ -314,14 +457,20 @@ class TraderRuntime:
                 logger.warning("strategy_unknown", strategy_name=name)
                 continue
             if name in SCALP_STRATEGY_NAMES:
-                strategies.append(
-                    strategy_cls(  # type: ignore[call-arg]
-                        scalp_mode_enabled=self.settings.scalp_mode_enabled,
-                        cooldown_seconds=self.settings.scalp_cooldown_seconds,
-                    )
+                strategy = strategy_cls(  # type: ignore[call-arg]
+                    scalp_mode_enabled=self.settings.scalp_mode_enabled,
+                    cooldown_seconds=self.settings.scalp_cooldown_seconds,
                 )
             else:
-                strategies.append(strategy_cls())
+                strategy = strategy_cls()
+            if self.settings.chaos_mode:
+                strategy = ChaosStrategyWrapper(strategy)
+                logger.info(
+                    "strategy_chaos_wrapped",
+                    strategy_name=name,
+                    account_id=self.settings.account_id,
+                )
+            strategies.append(strategy)
             logger.info("strategy_loaded", strategy_name=name)
         return strategies
 
@@ -371,6 +520,11 @@ class TraderRuntime:
                 "======================================="
             ),
             execution_mode=self.settings.execution_mode,
+        )
+        logger.info(
+            "tournament_account_loaded",
+            account_id=self.settings.account_id,
+            personality=self.settings.personality,
         )
 
 
