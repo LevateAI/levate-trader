@@ -70,6 +70,7 @@ class RsiMeanReversionStrategy(Strategy):
             )
 
         if current_rsi < 20 and not long_position:
+            signal_strength = min((20 - current_rsi) / 20, 1.0)
             reasoning = (
                 f"RSI(5) on {symbol} 5-minute bars is {current_rsi:.2f}, below 20. "
                 f"Placing long limit at current bid ${bid:.2f}; stop is 0.8% below "
@@ -84,12 +85,13 @@ class RsiMeanReversionStrategy(Strategy):
                 take_profit=None,
                 reasoning=reasoning,
                 strategy_name=self.name,
-                signal_strength=min((20 - current_rsi) / 20, 1.0),
-                confidence=0.5,
+                signal_strength=signal_strength,
+                confidence=_entry_confidence(signal_strength),
                 features={"rsi_5": current_rsi, "timeframe": "5m"},
             )
 
         if current_rsi > 80 and not short_position:
+            signal_strength = min((current_rsi - 80) / 20, 1.0)
             reasoning = (
                 f"RSI(5) on {symbol} 5-minute bars is {current_rsi:.2f}, above 80. "
                 f"Placing short limit at current ask ${ask:.2f}; stop is 0.8% above "
@@ -104,8 +106,8 @@ class RsiMeanReversionStrategy(Strategy):
                 take_profit=None,
                 reasoning=reasoning,
                 strategy_name=self.name,
-                signal_strength=min((current_rsi - 80) / 20, 1.0),
-                confidence=0.5,
+                signal_strength=signal_strength,
+                confidence=_entry_confidence(signal_strength),
                 features={"rsi_5": current_rsi, "timeframe": "5m"},
             )
 
@@ -131,6 +133,12 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
     rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0)
     return rsi.fillna(50)
+
+
+def _entry_confidence(signal_strength: float) -> float:
+    """Return a conservative positive-edge confidence for RSI entries."""
+    bounded_strength = min(max(signal_strength, 0.0), 1.0)
+    return min(0.65, 0.52 + (0.08 * bounded_strength))
 
 
 def _has_position(

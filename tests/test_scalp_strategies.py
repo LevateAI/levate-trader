@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from src.models import BTC_PERP, Side
+from src.models import BTC_PERP, Position, Side
 from src.strategies.book_imbalance import BookImbalanceStrategy
 from src.strategies.micro_rsi_scalp import MicroRsiScalpStrategy
 from src.strategies.volume_fade import VolumeFadeStrategy
@@ -72,6 +72,16 @@ def _book_state(
     }
 
 
+def _book_position() -> Position:
+    return Position(
+        symbol=BTC_PERP,
+        side=Side.LONG,
+        size=1.0,
+        entry_price=100.0,
+        strategy_name="book_imbalance",
+    )
+
+
 @pytest.mark.asyncio
 async def test_micro_rsi_scalp_fires_on_extreme_low() -> None:
     strategy = MicroRsiScalpStrategy()
@@ -82,6 +92,47 @@ async def test_micro_rsi_scalp_fires_on_extreme_low() -> None:
     assert signal.side == Side.LONG
     assert signal.entry_price == pytest.approx(100.1)
     assert signal.stop_loss == pytest.approx(100.1 * 0.997)
+
+
+@pytest.mark.asyncio
+async def test_micro_rsi_scalp_fires_with_foreign_strategy_position() -> None:
+    strategy = MicroRsiScalpStrategy()
+
+    signal = await strategy.on_tick(
+        _market_state(
+            bars_1m=_bars_1m(list(range(130, 100, -1))),
+            open_positions=[_book_position()],
+        )
+    )
+
+    assert signal is not None
+    assert signal.strategy_name == "micro_rsi_scalp"
+    assert signal.side == Side.LONG
+
+
+@pytest.mark.asyncio
+async def test_micro_rsi_scalp_fires_from_trade_events_after_warmup() -> None:
+    strategy = MicroRsiScalpStrategy(cooldown_seconds=0)
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+    signal = None
+
+    for index, price in enumerate(range(130, 99, -1)):
+        timestamp = start + timedelta(minutes=index)
+        signal = await strategy.on_tick(
+            {
+                "symbol": BTC_PERP,
+                "timestamp": timestamp,
+                "bid": price - 0.1,
+                "ask": price + 0.1,
+                "trade_events": [
+                    {"px": str(price), "sz": "1", "time": int(timestamp.timestamp() * 1000)}
+                ],
+                "open_positions": [],
+            }
+        )
+
+    assert signal is not None
+    assert signal.side == Side.LONG
 
 
 @pytest.mark.asyncio
@@ -262,6 +313,64 @@ async def test_volume_fade_fires_on_volume_dump() -> None:
     assert signal is not None
     assert signal.side == Side.LONG
     assert signal.entry_price == pytest.approx(99.7)
+
+
+@pytest.mark.asyncio
+async def test_volume_fade_fires_with_foreign_strategy_position() -> None:
+    strategy = VolumeFadeStrategy()
+    bars = _bars_1m([100] * 20 + [99.6], [10] * 20 + [40])
+
+    signal = await strategy.on_tick(
+        _market_state(
+            bars_1m=bars,
+            bid=99.5,
+            ask=99.7,
+            open_positions=[_book_position()],
+        )
+    )
+
+    assert signal is not None
+    assert signal.strategy_name == "volume_fade"
+    assert signal.side == Side.LONG
+
+
+@pytest.mark.asyncio
+async def test_volume_fade_fires_from_trade_events_after_warmup() -> None:
+    strategy = VolumeFadeStrategy(cooldown_seconds=0)
+    start = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+    signal = None
+
+    for index in range(20):
+        timestamp = start + timedelta(minutes=index)
+        signal = await strategy.on_tick(
+            {
+                "symbol": BTC_PERP,
+                "timestamp": timestamp,
+                "bid": 99.9,
+                "ask": 100.1,
+                "trade_events": [
+                    {"px": "100", "sz": "10", "time": int(timestamp.timestamp() * 1000)}
+                ],
+                "open_positions": [],
+            }
+        )
+    timestamp = start + timedelta(minutes=20)
+    signal = await strategy.on_tick(
+        {
+            "symbol": BTC_PERP,
+            "timestamp": timestamp,
+            "bid": 99.5,
+            "ask": 99.7,
+            "trade_events": [
+                {"px": "100", "sz": "20", "time": int(timestamp.timestamp() * 1000)},
+                {"px": "99.6", "sz": "20", "time": int(timestamp.timestamp() * 1000) + 30_000},
+            ],
+            "open_positions": [],
+        }
+    )
+
+    assert signal is not None
+    assert signal.side == Side.LONG
 
 
 @pytest.mark.asyncio

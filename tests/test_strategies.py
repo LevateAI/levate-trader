@@ -51,6 +51,7 @@ async def test_rsi_strategy_fires_long_on_oversold() -> None:
     assert signal is not None
     assert signal.side == Side.LONG
     assert signal.stop_loss == pytest.approx(90.9 * 0.992)
+    assert signal.confidence > 0.5
 
 
 @pytest.mark.asyncio
@@ -72,6 +73,7 @@ async def test_rsi_strategy_fires_short_on_overbought() -> None:
     assert signal is not None
     assert signal.side == Side.SHORT
     assert signal.stop_loss == pytest.approx(109.1 * 1.008)
+    assert signal.confidence > 0.5
 
 
 @pytest.mark.asyncio

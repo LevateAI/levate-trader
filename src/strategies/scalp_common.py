@@ -116,14 +116,24 @@ def is_scalp_strategy_name(strategy_name: str) -> bool:
     return strategy_name in SCALP_STRATEGY_NAMES
 
 
-def has_open_position(positions: list[Any], symbol: str) -> bool:
-    """Return whether any open position exists for the symbol."""
+def has_open_position(
+    positions: list[Any],
+    symbol: str,
+    strategy_name: str | None = None,
+) -> bool:
+    """Return whether an open position exists for the symbol."""
     for position in positions:
         if isinstance(position, Position):
-            if position.symbol == symbol:
+            if (
+                position.symbol == symbol
+                and (strategy_name is None or position.strategy_name == strategy_name)
+            ):
                 return True
             continue
-        if position.get("symbol") == symbol:
+        if (
+            position.get("symbol") == symbol
+            and (strategy_name is None or position.get("strategy_name") == strategy_name)
+        ):
             return True
     return False
 

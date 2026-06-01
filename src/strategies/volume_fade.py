@@ -48,7 +48,11 @@ class VolumeFadeStrategy(Strategy):
         symbol = str(market_state.get("symbol", ""))
         if symbol not in self.symbols:
             return None
-        if has_open_position(list(market_state.get("open_positions") or []), symbol):
+        if has_open_position(
+            list(market_state.get("open_positions") or []),
+            symbol,
+            strategy_name=self.name,
+        ):
             return None
         if not market_state.get("trade_events") and not market_state.get("bars_1m"):
             return None

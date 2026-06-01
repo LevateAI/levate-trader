@@ -9,8 +9,9 @@ import pytest
 from src.alerts.discord_notifier import DiscordNotifier
 from src.config import Settings
 from src.execution.paper_executor import PaperExecutor
-from src.models import BTC_PERP, EquitySnapshot, MarketState, OrderType, Side, Signal
+from src.models import BTC_PERP, ETH_PERP, EquitySnapshot, MarketState, OrderType, Side, Signal
 from src.risk.circuit_breakers import CircuitBreakerManager
+from src.strategies.rsi_mean_reversion import RsiMeanReversionStrategy
 
 
 @dataclass
@@ -352,6 +353,32 @@ async def test_paper_balance_never_goes_negative_or_circuit_breaker_trips() -> N
     assert executor.paper_balance_usd >= 0
     assert event is not None
     assert event.breaker_type == "max_drawdown"
+
+
+@pytest.mark.asyncio
+async def test_rsi_signal_sizes_above_zero_in_paper_executor() -> None:
+    strategy = RsiMeanReversionStrategy()
+    closes = [100, 99, 98, 97, 96, 95, 94, 93, 92, 91]
+    signal = await strategy.on_tick(
+        {
+            "symbol": ETH_PERP,
+            "bars_5m": [{"c": close} for close in closes],
+            "bid": 90.9,
+            "ask": 91.1,
+            "open_positions": [],
+        }
+    )
+    assert signal is not None
+
+    repository = DummyRepository()
+    executor = _executor(repository=repository)
+    await executor.update_market_state(_market(bid=90.9, ask=91.1, last=90.8, symbol=ETH_PERP))
+
+    result = await executor.execute_signal(signal, equity=1000, asset_realized_vol=0.02)
+
+    assert result is not None
+    assert result["status"] in {"pending", "filled"}
+    assert repository.inserts["strategy_signals"][-1]["action_taken"] != "rejected_zero_size"
 
 
 @pytest.mark.asyncio
