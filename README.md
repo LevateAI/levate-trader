@@ -94,6 +94,26 @@ to `true`.
 `CLOSE_POSITIONS_ON_SHUTDOWN`: reserved safety toggle for future shutdown
 behavior.
 
+### Polymarket Paper Bot
+
+`POLYMARKET_ACCOUNT_ID`: separate prediction-market account namespace. Defaults
+to `polymarket_crypto`.
+
+`POLYMARKET_STARTING_BALANCE_USD`: standalone Polymarket paper balance. Defaults
+to `500`.
+
+`POLYMARKET_POLL_INTERVAL_SEC`: two-feed polling cadence for Polymarket CLOB and
+Coinbase spot. Defaults to `2`.
+
+`POLYMARKET_STALE_THRESHOLD_SEC`: max feed silence before the Polymarket or
+Coinbase watchdog reconnects. Defaults to `20`.
+
+`POLYMARKET_MARKET_KEYWORDS`: comma-separated market-discovery filters for
+short-duration crypto markets. Defaults to `bitcoin,btc,ethereum,eth`.
+
+`POLYMARKET_FEE_RATE_CRYPTO`: Polymarket crypto taker fee coefficient used by
+the paper executor. Defaults to `0.07`.
+
 ## Execution Modes
 
 `paper_sim` is the default. It connects to Hyperliquid mainnet public market
@@ -115,6 +135,7 @@ the bot:
 1. `supabase/migrations/001_initial_schema.sql`
 2. `supabase/migrations/002_add_execution_mode.sql`
 3. `supabase/migrations/003_tournament_mode.sql`
+4. `supabase/migrations/20260601145523_polymarket_part1.sql`
 
 ## Tournament Mode
 
@@ -154,6 +175,30 @@ done
 
 Each unit reads `/home/levateai/levate-trader/envs/%i.env` and sets
 `ACCOUNT_ID=%i`.
+
+## Polymarket Module
+
+The Polymarket paper bot is bot #7, but it uses a separate leaderboard and
+separate `polymarket_*` Supabase tables because prediction shares resolve to
+`$0` or `$1`, not perp PnL.
+
+Part 1 runs only infrastructure: it reads public Polymarket CLOB books and
+Coinbase BTC/ETH spot prices, joins them into synchronized snapshots, writes
+`polymarket_market_snapshots`, and tracks a standalone `$500` paper account.
+There are no strategies, wallets, signing, or real-money order paths.
+
+Run locally:
+
+```bash
+python -m src.polymarket.main
+```
+
+Install the separate systemd unit, then start it:
+
+```bash
+sudo systemctl start levate-polymarket
+sudo journalctl -u levate-polymarket -f
+```
 
 ## Funding Hyperliquid Testnet
 
