@@ -114,6 +114,24 @@ short-duration crypto markets. Defaults to `bitcoin,btc,ethereum,eth`.
 `POLYMARKET_FEE_RATE_CRYPTO`: Polymarket crypto taker fee coefficient used by
 the paper executor. Defaults to `0.07`.
 
+`POLYMARKET_STRATEGIES_ENABLED`: comma-separated Polymarket strategies. Defaults
+to `multi_outcome_sum_arb,latency_arb`.
+
+`POLYMARKET_SUM_ARB_THRESHOLD`: minimum guaranteed edge per YES+NO pair after
+fees for sum arbitrage. Defaults to `0.02`.
+
+`POLYMARKET_SUM_ARB_MAX_ACCOUNT_PCT`: max account equity allocated to one
+sum-arb pair. Defaults to `0.10`.
+
+`POLYMARKET_LATENCY_EDGE_THRESHOLD`: minimum model edge for probabilistic
+Coinbase-vs-Polymarket latency arb. Defaults to `0.05`.
+
+`POLYMARKET_LATENCY_MAX_ACCOUNT_PCT`: max account equity allocated to one
+latency-arb leg. Defaults to `0.05`.
+
+`POLYMARKET_VOL_WINDOW_SEC`: rolling Coinbase spot window used for realized
+volatility. Defaults to `900`.
+
 ## Execution Modes
 
 `paper_sim` is the default. It connects to Hyperliquid mainnet public market
@@ -182,10 +200,19 @@ The Polymarket paper bot is bot #7, but it uses a separate leaderboard and
 separate `polymarket_*` Supabase tables because prediction shares resolve to
 `$0` or `$1`, not perp PnL.
 
-Part 1 runs only infrastructure: it reads public Polymarket CLOB books and
-Coinbase BTC/ETH spot prices, joins them into synchronized snapshots, writes
-`polymarket_market_snapshots`, and tracks a standalone `$500` paper account.
-There are no strategies, wallets, signing, or real-money order paths.
+The module reads public Polymarket CLOB books and Coinbase BTC/ETH spot prices,
+joins them into synchronized snapshots, writes `polymarket_market_snapshots`,
+and tracks a standalone `$500` paper account. It has no wallets, signing, or
+real-money order paths.
+
+The first two paper strategies are:
+
+- `multi_outcome_sum_arb`: buys equal YES and NO shares only when the filled
+  pair cost, including fees and walked book depth, leaves a provable settlement
+  edge.
+- `latency_arb`: estimates fair YES probability from Coinbase spot and recent
+  realized volatility, then buys an underpriced side only when the model edge
+  clears the configured threshold. This is probabilistic, not guaranteed.
 
 Run locally:
 

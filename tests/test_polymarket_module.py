@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from src.polymarket.feeds import FeedWatchdog
+from src.polymarket.main import PolymarketRuntime
 from src.polymarket.models import (
     CoinbaseSpotPrice,
     PolymarketBookLevel,
+    PolymarketMarketContext,
+    PolymarketMarketSnapshot,
     PolymarketMarket,
     PolymarketOrderBook,
     PolymarketSide,
     fee_for_trade,
 )
 from src.polymarket.paper_executor import PolymarketPaperExecutor
+from src.polymarket.strategies import LatencyArbStrategy, MultiOutcomeSumArbitrageStrategy
 from src.polymarket.synchronizer import PolymarketDataSynchronizer
+from src.polymarket.volatility import CoinbaseVolatilityTracker
 
 
 def _market() -> PolymarketMarket:
@@ -46,6 +54,47 @@ def _book(
         bids=[PolymarketBookLevel(price=price, size=size) for price, size in (bids or [])],
         asks=[PolymarketBookLevel(price=price, size=size) for price, size in (asks or [])],
     )
+
+
+def _context(
+    *,
+    market: PolymarketMarket | None = None,
+    yes_book: PolymarketOrderBook | None = None,
+    no_book: PolymarketOrderBook | None = None,
+    spot: float = 101_000,
+) -> PolymarketMarketContext:
+    market = market or _market()
+    yes_book = yes_book or _book(PolymarketSide.YES, asks=[(0.62, 100)])
+    no_book = no_book or _book(PolymarketSide.NO, asks=[(0.4, 100)])
+    return PolymarketMarketContext(
+        market=market,
+        yes_book=yes_book,
+        no_book=no_book,
+        snapshot=PolymarketMarketSnapshot(
+            market_id=market.market_id,
+            market_question=market.question,
+            yes_price=yes_book.best_ask or yes_book.best_bid or 0,
+            no_price=no_book.best_ask or no_book.best_bid or 0,
+            yes_book_depth=yes_book.ask_depth,
+            no_book_depth=no_book.ask_depth,
+            coinbase_ref_price=spot,
+            implied_gap=0,
+            resolution_time=market.resolution_time,
+            timestamp=datetime.now(tz=UTC),
+        ),
+    )
+
+
+@dataclass
+class FakeRepository:
+    trades: list[Any] = field(default_factory=list)
+    positions: list[Any] = field(default_factory=list)
+
+    async def insert_trade(self, trade: Any) -> None:
+        self.trades.append(trade)
+
+    async def insert_position(self, position: Any) -> None:
+        self.positions.append(position)
 
 
 class FakeClob:
@@ -194,3 +243,141 @@ async def test_feed_watchdog_fires_on_stale_feed() -> None:
 def test_polymarket_crypto_fee_formula() -> None:
     assert fee_for_trade(shares=100, avg_price=0.5, taker_fee_rate=0.07) == pytest.approx(1.75)
 
+
+@pytest.mark.asyncio
+async def test_sum_arb_detects_and_sizes_within_book_depth() -> None:
+    strategy = MultiOutcomeSumArbitrageStrategy(threshold=0.02, max_account_pct=0.10)
+    context = _context(
+        yes_book=_book(PolymarketSide.YES, asks=[(0.45, 30)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.45, 30)]),
+    )
+
+    signal = await strategy.on_context(
+        context,
+        account_equity=500,
+        volatility_tracker=CoinbaseVolatilityTracker(),
+    )
+
+    assert signal is not None
+    assert signal.strategy_name == "multi_outcome_sum_arb"
+    assert len(signal.legs) == 2
+    assert signal.legs[0].shares == pytest.approx(signal.legs[1].shares)
+    assert signal.legs[0].shares <= 30
+    assert signal.features["edge_after_fees"] > 0.02
+
+
+@pytest.mark.asyncio
+async def test_sum_arb_rejects_when_second_leg_erases_edge() -> None:
+    strategy = MultiOutcomeSumArbitrageStrategy(threshold=0.02, max_account_pct=0.10)
+    context = _context(
+        yes_book=_book(PolymarketSide.YES, asks=[(0.45, 10)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.45, 1), (0.75, 9)]),
+    )
+
+    signal = await strategy.on_context(
+        context,
+        account_equity=500,
+        volatility_tracker=CoinbaseVolatilityTracker(),
+    )
+
+    assert signal is None
+
+
+def test_latency_fair_value_model_produces_sane_probability() -> None:
+    tracker = CoinbaseVolatilityTracker(window_sec=3600)
+    now = datetime.now(tz=UTC)
+    tracker.record_price("BTC", 104_900, now - timedelta(seconds=120))
+    tracker.record_price("BTC", 104_950, now - timedelta(seconds=60))
+    tracker.record_price("BTC", 105_000, now)
+
+    probability = tracker.fair_yes_probability("BTC", 105_000, 100_000, 3600)
+
+    assert probability is not None
+    assert 0.5 < probability <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_latency_arb_emits_signal_only_when_edge_exceeds_threshold() -> None:
+    strategy = LatencyArbStrategy(edge_threshold=0.05, max_account_pct=0.05)
+    now = datetime.now(tz=UTC)
+    tracker = CoinbaseVolatilityTracker(window_sec=3600)
+    tracker.record_price("BTC", 104_900, now - timedelta(seconds=120))
+    tracker.record_price("BTC", 104_950, now - timedelta(seconds=60))
+    tracker.record_price("BTC", 105_000, now)
+    market = _market()
+    market.resolution_time = now + timedelta(hours=1)
+    cheap_context = _context(
+        market=market,
+        spot=105_000,
+        yes_book=_book(PolymarketSide.YES, asks=[(0.80, 100)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.30, 100)]),
+    )
+    rich_context = _context(
+        market=market,
+        spot=105_000,
+        yes_book=_book(PolymarketSide.YES, asks=[(0.99, 100)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.30, 100)]),
+    )
+
+    signal = await strategy.on_context(cheap_context, 500, tracker, now=now)
+    no_signal = await LatencyArbStrategy(edge_threshold=0.05).on_context(
+        rich_context,
+        500,
+        tracker,
+        now=now,
+    )
+
+    assert signal is not None
+    assert signal.strategy_name == "latency_arb"
+    assert signal.legs[0].side == PolymarketSide.YES
+    assert signal.features["fair_yes_probability"] > signal.legs[0].expected_avg_price
+    assert no_signal is None
+
+
+@pytest.mark.asyncio
+async def test_polymarket_runtime_halts_strategies_when_feed_is_stale() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.settings = SimpleNamespace(polymarket_stale_threshold_sec=20)
+    runtime.clob = SimpleNamespace(
+        watchdog=SimpleNamespace(last_message_at=time.monotonic() - 21)
+    )
+    runtime.coinbase = SimpleNamespace(
+        watchdog=SimpleNamespace(last_message_at=time.monotonic())
+    )
+    runtime.executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
+    runtime.repository = FakeRepository()
+    runtime.volatility_tracker = CoinbaseVolatilityTracker()
+    runtime.strategies = [MultiOutcomeSumArbitrageStrategy(threshold=0.02, max_account_pct=0.10)]
+    context = _context(
+        yes_book=_book(PolymarketSide.YES, asks=[(0.45, 30)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.45, 30)]),
+    )
+
+    await runtime._run_strategies_for_context(context)
+
+    assert not runtime.executor.trades
+    assert not runtime.repository.trades
+
+
+@pytest.mark.asyncio
+async def test_runtime_settlement_writes_resolved_trade_and_position() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
+    runtime.repository = FakeRepository()
+    market = _market()
+    market.resolution_time = datetime.now(tz=UTC) - timedelta(seconds=1)
+    await runtime.executor.open_position(
+        market.market_id,
+        PolymarketSide.YES,
+        10,
+        _book(PolymarketSide.YES, asks=[(0.62, 10)]),
+        "test",
+        "runtime settlement test",
+    )
+    context = _context(market=market, spot=101_000)
+
+    settled = await runtime._settle_if_due(context)
+
+    assert settled is True
+    assert runtime.repository.trades[-1].pnl_usd == pytest.approx(10 * (1 - 0.62))
+    assert runtime.repository.positions[-1].status == "resolved"

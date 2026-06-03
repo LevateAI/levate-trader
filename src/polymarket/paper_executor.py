@@ -17,6 +17,7 @@ from src.polymarket.models import (
     PolymarketTradeStatus,
     fee_for_trade,
 )
+from src.polymarket.signals import PolymarketSignal
 
 logger = structlog.get_logger(__name__)
 
@@ -37,6 +38,7 @@ class PolymarketPaperExecutor:
         self.fees_enabled = fees_enabled
         self.positions: dict[tuple[str, PolymarketSide], PolymarketPosition] = {}
         self.trades: dict[str, PolymarketTrade] = {}
+        self.closed_positions: list[PolymarketPosition] = []
 
     @property
     def equity_usd(self) -> float:
@@ -47,6 +49,21 @@ class PolymarketPaperExecutor:
             if position.status == PolymarketPositionStatus.OPEN
         )
         return _money(self.balance_usd + open_value)
+
+    async def execute_signal(self, signal: PolymarketSignal) -> list[PolymarketTrade]:
+        """Execute a strategy signal using the existing paper fill model."""
+        trades: list[PolymarketTrade] = []
+        for leg in signal.legs:
+            trade = await self.open_position(
+                market_id=signal.market_id,
+                side=leg.side,
+                requested_shares=leg.shares,
+                order_book=leg.order_book,
+                strategy_name=signal.strategy_name,
+                reason_entry=signal.reason_entry,
+            )
+            trades.append(trade)
+        return trades
 
     async def open_position(
         self,
@@ -183,6 +200,7 @@ class PolymarketPaperExecutor:
             position.shares = 0.0
             position.status = PolymarketPositionStatus.CLOSED
             self.positions.pop((market_id, side), None)
+            self.closed_positions.append(position)
 
         trade = PolymarketTrade(
             id=uuid4(),
@@ -228,6 +246,7 @@ class PolymarketPaperExecutor:
         position.status = PolymarketPositionStatus.RESOLVED
         position.resolution_outcome = resolution_outcome
         self.positions.pop((market_id, side), None)
+        self.closed_positions.append(position)
 
         trade = PolymarketTrade(
             id=uuid4(),

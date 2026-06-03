@@ -25,6 +25,13 @@ class PolymarketSettings(BaseSettings):
     polymarket_max_markets: int = 10
     polymarket_market_keywords: str = "bitcoin,btc,ethereum,eth"
     polymarket_fee_rate_crypto: float = 0.07
+    polymarket_strategies_enabled: str = "multi_outcome_sum_arb,latency_arb"
+    polymarket_sum_arb_threshold: float = 0.02
+    polymarket_sum_arb_max_account_pct: float = 0.10
+    polymarket_latency_edge_threshold: float = 0.05
+    polymarket_latency_max_account_pct: float = 0.05
+    polymarket_vol_window_sec: int = 900
+    polymarket_strategy_cooldown_sec: int = 300
 
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
@@ -56,6 +63,19 @@ class PolymarketSettings(BaseSettings):
             raise ValueError("Polymarket fee rate cannot be negative")
         return value
 
+    @field_validator(
+        "polymarket_sum_arb_threshold",
+        "polymarket_sum_arb_max_account_pct",
+        "polymarket_latency_edge_threshold",
+        "polymarket_latency_max_account_pct",
+    )
+    @classmethod
+    def validate_strategy_fractions(cls, value: float) -> float:
+        """Validate non-negative strategy fraction settings."""
+        if value < 0:
+            raise ValueError("Polymarket strategy fractions cannot be negative")
+        return value
+
     @property
     def market_keywords(self) -> list[str]:
         """Return normalized keywords used for crypto market discovery."""
@@ -65,3 +85,11 @@ class PolymarketSettings(BaseSettings):
             if keyword.strip()
         ]
 
+    @property
+    def enabled_strategy_names(self) -> list[str]:
+        """Return enabled Polymarket strategies as normalized identifiers."""
+        return [
+            name.strip()
+            for name in self.polymarket_strategies_enabled.split(",")
+            if name.strip()
+        ]

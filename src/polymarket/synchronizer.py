@@ -10,6 +10,7 @@ import structlog
 from src.polymarket.feeds import CoinbaseSpotClient, PolymarketClobClient
 from src.polymarket.models import (
     PolymarketMarket,
+    PolymarketMarketContext,
     PolymarketMarketSnapshot,
     PolymarketOrderBook,
     compute_implied_gap,
@@ -56,8 +57,8 @@ class PolymarketDataSynchronizer:
         )
         self._markets_loaded_at = now
 
-    async def build_snapshot(self, market: PolymarketMarket) -> PolymarketMarketSnapshot | None:
-        """Build one synchronized CLOB/spot snapshot."""
+    async def build_context(self, market: PolymarketMarket) -> PolymarketMarketContext | None:
+        """Build one synchronized strategy context."""
         books, spot = await asyncio.gather(
             self._clob.fetch_books_for_market(market),
             self._coinbase.fetch_spot(market.asset_symbol),
@@ -74,7 +75,7 @@ class PolymarketDataSynchronizer:
             )
             return None
         timestamp = max(yes_book.timestamp, no_book.timestamp, spot.timestamp)
-        return PolymarketMarketSnapshot(
+        snapshot = PolymarketMarketSnapshot(
             market_id=market.market_id,
             market_question=market.question,
             yes_price=yes_price,
@@ -91,15 +92,33 @@ class PolymarketDataSynchronizer:
             resolution_time=market.resolution_time,
             timestamp=timestamp,
         )
+        return PolymarketMarketContext(
+            market=market,
+            snapshot=snapshot,
+            yes_book=yes_book,
+            no_book=no_book,
+        )
+
+    async def build_snapshot(self, market: PolymarketMarket) -> PolymarketMarketSnapshot | None:
+        """Build one synchronized CLOB/spot snapshot."""
+        context = await self.build_context(market)
+        return context.snapshot if context is not None else None
+
+    async def build_contexts(self) -> list[PolymarketMarketContext]:
+        """Build strategy contexts for the tracked market universe."""
+        await self.refresh_markets_if_needed()
+        contexts: list[PolymarketMarketContext] = []
+        for market in self._markets:
+            context = await self.build_context(market)
+            if context is not None:
+                contexts.append(context)
+        logger.info("polymarket_contexts_built", count=len(contexts))
+        return contexts
 
     async def build_snapshots(self) -> list[PolymarketMarketSnapshot]:
         """Build snapshots for the tracked market universe."""
-        await self.refresh_markets_if_needed()
-        snapshots: list[PolymarketMarketSnapshot] = []
-        for market in self._markets:
-            snapshot = await self.build_snapshot(market)
-            if snapshot is not None:
-                snapshots.append(snapshot)
+        contexts = await self.build_contexts()
+        snapshots = [context.snapshot for context in contexts]
         logger.info("polymarket_snapshots_built", count=len(snapshots))
         return snapshots
 

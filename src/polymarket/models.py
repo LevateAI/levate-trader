@@ -131,6 +131,16 @@ class PolymarketMarketSnapshot:
 
 
 @dataclass(slots=True)
+class PolymarketMarketContext:
+    """Live strategy context with snapshot plus full CLOB books."""
+
+    market: PolymarketMarket
+    snapshot: PolymarketMarketSnapshot
+    yes_book: PolymarketOrderBook
+    no_book: PolymarketOrderBook
+
+
+@dataclass(slots=True)
 class PolymarketPosition:
     """In-memory paper position for prediction shares."""
 
@@ -228,4 +238,3 @@ def fee_for_trade(shares: float, avg_price: float, taker_fee_rate: float) -> flo
     if shares <= 0 or avg_price <= 0 or taker_fee_rate <= 0:
         return 0.0
     return shares * taker_fee_rate * avg_price * (1 - avg_price)
-
