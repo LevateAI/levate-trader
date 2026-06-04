@@ -10,6 +10,7 @@ import asyncio
 import signal
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
@@ -31,12 +32,19 @@ from src.polymarket.volatility import CoinbaseVolatilityTracker
 
 logger = structlog.get_logger(__name__)
 
+HEARTBEAT_COMPONENTS: tuple[str, ...] = ("snapshot", "strategy", "settle", "equity")
+LOOP_ERROR_BACKOFF_SEC = 5.0
+
+
+class PolymarketComponentStaleError(RuntimeError):
+    """Raised when a Polymarket runtime component has stopped doing useful work."""
+
 
 class PolymarketRuntime:
     """Coordinates two-feed snapshots and paper account bookkeeping."""
 
     def __init__(self, settings: PolymarketSettings | None = None) -> None:
-        self.settings = settings or PolymarketSettings()
+        self.settings = settings or PolymarketSettings()  # type: ignore[call-arg]
         configure_logging(self.settings.log_level)
         self.stop_event = asyncio.Event()
         self.clob = PolymarketClobClient(
@@ -67,6 +75,19 @@ class PolymarketRuntime:
             window_sec=self.settings.polymarket_vol_window_sec,
         )
         self.strategies = self._load_strategies()
+        started_at_mono = time.monotonic()
+        started_at_wall = datetime.now(tz=UTC)
+        self._heartbeat_components = HEARTBEAT_COMPONENTS
+        self._last_success: dict[str, float] = {
+            component: started_at_mono for component in self._heartbeat_components
+        }
+        self._last_success_wall: dict[str, datetime] = {
+            component: started_at_wall for component in self._heartbeat_components
+        }
+        self._heartbeat_detail: dict[str, dict[str, Any]] = {
+            component: {"state": "initializing"} for component in self._heartbeat_components
+        }
+        self._latest_contexts: dict[str, PolymarketMarketContext] = {}
 
     async def run(self) -> None:
         """Run the Polymarket data layer until shutdown."""
@@ -82,7 +103,10 @@ class PolymarketRuntime:
         )
         tasks = [
             asyncio.create_task(self._snapshot_loop(), name="polymarket-snapshot-loop"),
+            asyncio.create_task(self._strategy_loop(), name="polymarket-strategy-loop"),
+            asyncio.create_task(self._settlement_loop(), name="polymarket-settlement-loop"),
             asyncio.create_task(self._equity_loop(), name="polymarket-equity-loop"),
+            asyncio.create_task(self._watchdog_loop(), name="polymarket-runtime-watchdog"),
             asyncio.create_task(
                 self.clob.watchdog.watchdog_loop(self.clob.reconnect),
                 name="polymarket-clob-watchdog",
@@ -92,59 +116,259 @@ class PolymarketRuntime:
                 name="coinbase-spot-watchdog",
             ),
         ]
-        await self.stop_event.wait()
-        logger.info("polymarket_runtime_shutdown_started")
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await self.clob.close()
-        await self.coinbase.close()
-        logger.info("polymarket_runtime_shutdown_complete")
+        try:
+            await self._supervise_tasks(tasks)
+        finally:
+            logger.info("polymarket_runtime_shutdown_started")
+            await self._cancel_tasks(tasks)
+            await self.clob.close()
+            await self.coinbase.close()
+            logger.info("polymarket_runtime_shutdown_complete")
 
     def request_shutdown(self) -> None:
         """Request graceful shutdown."""
         self.stop_event.set()
 
+    async def _supervise_tasks(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Wait for shutdown or fail loudly when any worker task exits."""
+        stop_task = asyncio.create_task(self.stop_event.wait(), name="polymarket-stop-wait")
+        try:
+            done, _ = await asyncio.wait(
+                [*tasks, stop_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done and self.stop_event.is_set():
+                return
+            for task in done:
+                if task is stop_task:
+                    continue
+                task_name = task.get_name()
+                if task.cancelled():
+                    logger.critical("polymarket_task_cancelled", task_name=task_name)
+                    raise RuntimeError(f"Polymarket task cancelled unexpectedly: {task_name}")
+                exc = task.exception()
+                if exc is not None:
+                    logger.critical(
+                        "polymarket_task_failed",
+                        task_name=task_name,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                    raise exc
+                logger.critical("polymarket_task_exited", task_name=task_name)
+                raise RuntimeError(f"Polymarket task exited unexpectedly: {task_name}")
+        finally:
+            stop_task.cancel()
+            try:
+                await stop_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _cancel_tasks(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Cancel worker tasks during shutdown without hiding live supervisor failures."""
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error(
+                    "polymarket_task_cleanup_error",
+                    task_name=task.get_name(),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+
     async def _snapshot_loop(self) -> None:
         while True:
             try:
-                contexts = await self.synchronizer.build_contexts()
-                for context in contexts:
-                    await self.repository.insert_snapshot(context.snapshot)
-                    self.volatility_tracker.record_price(
-                        asset_symbol=context.market.asset_symbol,
-                        price=context.snapshot.coinbase_ref_price,
-                        timestamp=context.snapshot.timestamp,
-                    )
-                    await self._mark_open_positions(context)
-                    if not self._feeds_fresh():
-                        continue
-                    if await self._settle_if_due(context):
-                        continue
-                    await self._run_strategies_for_context(context)
-            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                await self._snapshot_iteration()
+            except Exception as exc:
                 logger.error(
                     "polymarket_snapshot_loop_error",
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                 )
+                await asyncio.sleep(LOOP_ERROR_BACKOFF_SEC)
+                continue
+            await asyncio.sleep(self.settings.polymarket_poll_interval_sec)
+
+    async def _strategy_loop(self) -> None:
+        while True:
+            try:
+                await self._strategy_iteration()
+            except Exception as exc:
+                logger.error(
+                    "polymarket_strategy_loop_error",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                await asyncio.sleep(LOOP_ERROR_BACKOFF_SEC)
+                continue
+            await asyncio.sleep(self.settings.polymarket_poll_interval_sec)
+
+    async def _settlement_loop(self) -> None:
+        while True:
+            try:
+                await self._settlement_iteration()
+            except Exception as exc:
+                logger.error(
+                    "polymarket_settlement_loop_error",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                await asyncio.sleep(LOOP_ERROR_BACKOFF_SEC)
+                continue
             await asyncio.sleep(self.settings.polymarket_poll_interval_sec)
 
     async def _equity_loop(self) -> None:
         while True:
             try:
-                await self.repository.insert_equity_snapshot(
-                    balance_usd=self.executor.balance_usd,
-                    equity_usd=self.executor.equity_usd,
-                    open_position_count=len(self.executor.positions),
-                )
-            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                await self._equity_iteration()
+            except Exception as exc:
                 logger.error(
                     "polymarket_equity_loop_error",
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                 )
+                await asyncio.sleep(LOOP_ERROR_BACKOFF_SEC)
+                continue
             await asyncio.sleep(60)
+
+    async def _watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.watchdog_interval_seconds)
+            try:
+                await self._watchdog_check_once()
+            except PolymarketComponentStaleError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "polymarket_watchdog_loop_error",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                await asyncio.sleep(LOOP_ERROR_BACKOFF_SEC)
+
+    async def _snapshot_iteration(self) -> None:
+        contexts = await self.synchronizer.build_contexts()
+        if not contexts:
+            return
+        for context in contexts:
+            await self.repository.insert_snapshot(context.snapshot)
+            self._latest_contexts[context.market.market_id] = context
+            self.volatility_tracker.record_price(
+                asset_symbol=context.market.asset_symbol,
+                price=context.snapshot.coinbase_ref_price,
+                timestamp=context.snapshot.timestamp,
+            )
+            await self._mark_open_positions(context)
+        self._mark_success(
+            "snapshot",
+            {
+                "context_count": len(contexts),
+                "open_position_count": len(self.executor.positions),
+            },
+        )
+
+    async def _strategy_iteration(self) -> None:
+        contexts = list(self._latest_contexts.values())
+        if not contexts:
+            return
+        evaluated_count = 0
+        executed_count = 0
+        feeds_fresh = self._feeds_fresh()
+        if not feeds_fresh:
+            return
+        if feeds_fresh:
+            for context in contexts:
+                evaluated_count += 1
+                if await self._run_strategies_for_context(context):
+                    executed_count += 1
+        self._mark_success(
+            "strategy",
+            {
+                "context_count": len(contexts),
+                "evaluated_count": evaluated_count,
+                "executed_count": executed_count,
+                "feeds_fresh": feeds_fresh,
+            },
+        )
+
+    async def _settlement_iteration(self) -> None:
+        contexts = list(self._latest_contexts.values())
+        if not contexts:
+            return
+        settled_count = 0
+        feeds_fresh = self._feeds_fresh()
+        if not feeds_fresh:
+            return
+        if feeds_fresh:
+            for context in contexts:
+                if await self._settle_if_due(context):
+                    settled_count += 1
+        self._mark_success(
+            "settle",
+            {
+                "context_count": len(contexts),
+                "settled_count": settled_count,
+                "feeds_fresh": feeds_fresh,
+            },
+        )
+
+    async def _equity_iteration(self) -> None:
+        await self.repository.insert_equity_snapshot(
+            balance_usd=self.executor.balance_usd,
+            equity_usd=self.executor.equity_usd,
+            open_position_count=len(self.executor.positions),
+        )
+        self._mark_success(
+            "equity",
+            {
+                "balance_usd": self.executor.balance_usd,
+                "equity_usd": self.executor.equity_usd,
+                "open_position_count": len(self.executor.positions),
+            },
+        )
+
+    async def _watchdog_check_once(self) -> None:
+        now_mono = time.monotonic()
+        stale_component: str | None = None
+        stale_age = 0.0
+        for component in self._heartbeat_components:
+            last_success_mono = self._last_success[component]
+            last_success_wall = self._last_success_wall[component]
+            age_sec = now_mono - last_success_mono
+            detail = {
+                **self._heartbeat_detail.get(component, {}),
+                "age_sec": round(age_sec, 2),
+                "stale_limit_seconds": self.settings.stale_limit_seconds,
+            }
+            await self.repository.upsert_heartbeat(
+                component=component,
+                last_ok_at=last_success_wall,
+                detail=detail,
+            )
+            if age_sec > self.settings.stale_limit_seconds and stale_component is None:
+                stale_component = component
+                stale_age = age_sec
+        if stale_component is not None:
+            logger.critical(
+                "polymarket_component_stale",
+                component=stale_component,
+                age_sec=round(stale_age, 2),
+                stale_limit_seconds=self.settings.stale_limit_seconds,
+            )
+            raise PolymarketComponentStaleError(
+                f"Polymarket component stale: {stale_component} age={stale_age:.2f}s"
+            )
+
+    def _mark_success(self, component: str, detail: dict[str, Any] | None = None) -> None:
+        self._last_success[component] = time.monotonic()
+        self._last_success_wall[component] = datetime.now(tz=UTC)
+        self._heartbeat_detail[component] = detail or {}
 
     def _load_strategies(self) -> list[PolymarketStrategy]:
         strategies: list[PolymarketStrategy] = []
@@ -153,6 +377,7 @@ class PolymarketRuntime:
             if strategy_cls is None:
                 logger.warning("polymarket_strategy_unknown", strategy_name=name)
                 continue
+            strategy: PolymarketStrategy
             if strategy_cls is MultiOutcomeSumArbitrageStrategy:
                 strategy = strategy_cls(
                     threshold=self.settings.polymarket_sum_arb_threshold,
@@ -171,11 +396,11 @@ class PolymarketRuntime:
             logger.info("polymarket_strategy_loaded", strategy_name=name)
         return strategies
 
-    async def _run_strategies_for_context(self, context: PolymarketMarketContext) -> None:
+    async def _run_strategies_for_context(self, context: PolymarketMarketContext) -> bool:
         if not self._feeds_fresh():
-            return
+            return False
         if self._market_has_open_position(context.market.market_id):
-            return
+            return False
         for strategy in self.strategies:
             signal_result = await strategy.on_context(
                 context=context,
@@ -185,7 +410,8 @@ class PolymarketRuntime:
             if signal_result is None:
                 continue
             await self._execute_signal(signal_result)
-            break
+            return True
+        return False
 
     async def _execute_signal(self, signal: PolymarketSignal) -> None:
         trades = await self.executor.execute_signal(signal)
@@ -231,7 +457,10 @@ class PolymarketRuntime:
         return settled_any
 
     def _market_has_open_position(self, market_id: str) -> bool:
-        return any(position_market_id == market_id for position_market_id, _ in self.executor.positions)
+        return any(
+            position_market_id == market_id
+            for position_market_id, _ in self.executor.positions
+        )
 
     def _feeds_fresh(self) -> bool:
         clob_age = time.monotonic() - self.clob.watchdog.last_message_at

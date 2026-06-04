@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ from typing import Any
 import pytest
 
 from src.polymarket.feeds import FeedWatchdog
-from src.polymarket.main import PolymarketRuntime
+from src.polymarket.main import PolymarketComponentStaleError, PolymarketRuntime
 from src.polymarket.models import (
     CoinbaseSpotPrice,
     PolymarketBookLevel,
@@ -89,12 +90,45 @@ def _context(
 class FakeRepository:
     trades: list[Any] = field(default_factory=list)
     positions: list[Any] = field(default_factory=list)
+    equity_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    heartbeats: list[dict[str, Any]] = field(default_factory=list)
+    fail_equity: bool = False
 
     async def insert_trade(self, trade: Any) -> None:
         self.trades.append(trade)
 
     async def insert_position(self, position: Any) -> None:
         self.positions.append(position)
+
+    async def insert_equity_snapshot(
+        self,
+        balance_usd: float,
+        equity_usd: float,
+        open_position_count: int,
+    ) -> None:
+        if self.fail_equity:
+            raise RuntimeError("equity insert failed")
+        self.equity_snapshots.append(
+            {
+                "balance_usd": balance_usd,
+                "equity_usd": equity_usd,
+                "open_position_count": open_position_count,
+            }
+        )
+
+    async def upsert_heartbeat(
+        self,
+        component: str,
+        last_ok_at: datetime,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        self.heartbeats.append(
+            {
+                "component": component,
+                "last_ok_at": last_ok_at,
+                "detail": detail or {},
+            }
+        )
 
 
 class FakeClob:
@@ -357,6 +391,73 @@ async def test_polymarket_runtime_halts_strategies_when_feed_is_stale() -> None:
 
     assert not runtime.executor.trades
     assert not runtime.repository.trades
+
+
+@pytest.mark.asyncio
+async def test_equity_success_is_marked_only_after_db_write_succeeds() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
+    runtime.repository = FakeRepository()
+    runtime._last_success = {"equity": 1.0}
+    runtime._last_success_wall = {"equity": datetime(2026, 6, 1, tzinfo=UTC)}
+    runtime._heartbeat_detail = {"equity": {"state": "old"}}
+
+    await runtime._equity_iteration()
+
+    assert runtime.repository.equity_snapshots
+    assert runtime._last_success["equity"] > 1.0
+    assert runtime._heartbeat_detail["equity"]["open_position_count"] == 0
+
+    last_success = runtime._last_success["equity"]
+    runtime.repository.fail_equity = True
+
+    with pytest.raises(RuntimeError, match="equity insert failed"):
+        await runtime._equity_iteration()
+
+    assert runtime._last_success["equity"] == last_success
+
+
+@pytest.mark.asyncio
+async def test_polymarket_watchdog_upserts_and_raises_on_stale_component() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.settings = SimpleNamespace(stale_limit_seconds=1)
+    runtime.repository = FakeRepository()
+    runtime._heartbeat_components = ("snapshot", "equity")
+    runtime._last_success = {
+        "snapshot": time.monotonic() - 2,
+        "equity": time.monotonic(),
+    }
+    runtime._last_success_wall = {
+        "snapshot": datetime.now(tz=UTC) - timedelta(seconds=2),
+        "equity": datetime.now(tz=UTC),
+    }
+    runtime._heartbeat_detail = {
+        "snapshot": {"context_count": 1},
+        "equity": {"open_position_count": 0},
+    }
+
+    with pytest.raises(PolymarketComponentStaleError, match="snapshot"):
+        await runtime._watchdog_check_once()
+
+    assert [row["component"] for row in runtime.repository.heartbeats] == [
+        "snapshot",
+        "equity",
+    ]
+    assert runtime.repository.heartbeats[0]["detail"]["age_sec"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_polymarket_task_supervisor_propagates_worker_failure() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.stop_event = asyncio.Event()
+
+    async def dead_worker() -> None:
+        raise RuntimeError("worker died")
+
+    task = asyncio.create_task(dead_worker(), name="dead-worker")
+
+    with pytest.raises(RuntimeError, match="worker died"):
+        await runtime._supervise_tasks([task])
 
 
 @pytest.mark.asyncio

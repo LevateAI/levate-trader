@@ -369,9 +369,11 @@ def _fee_rate_from_payload(item: dict[str, Any], default_crypto_rate: float) -> 
                 except (TypeError, ValueError):
                     break
     raw_fee = item.get("fee")
-    if raw_fee not in (None, ""):
+    if isinstance(raw_fee, (int, float)):
+        return float(raw_fee)
+    if isinstance(raw_fee, str) and raw_fee:
         try:
             return float(raw_fee)
-        except (TypeError, ValueError):
+        except ValueError:
             pass
     return default_crypto_rate

@@ -32,6 +32,8 @@ class PolymarketSettings(BaseSettings):
     polymarket_latency_max_account_pct: float = 0.05
     polymarket_vol_window_sec: int = 900
     polymarket_strategy_cooldown_sec: int = 300
+    stale_limit_seconds: int = 120
+    watchdog_interval_seconds: int = 15
 
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
@@ -47,6 +49,8 @@ class PolymarketSettings(BaseSettings):
         "polymarket_market_refresh_sec",
         "polymarket_stale_threshold_sec",
         "polymarket_max_markets",
+        "stale_limit_seconds",
+        "watchdog_interval_seconds",
     )
     @classmethod
     def validate_positive_numbers(cls, value: float | int) -> float | int:

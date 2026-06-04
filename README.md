@@ -214,6 +214,11 @@ The first two paper strategies are:
   realized volatility, then buys an underpriced side only when the model edge
   clears the configured threshold. This is probabilistic, not guaranteed.
 
+Runtime liveness is work-gated. `STALE_LIMIT_SECONDS` controls how long a
+Polymarket component can go without a proven successful iteration before the
+process exits for systemd restart. `WATCHDOG_INTERVAL_SECONDS` controls how
+often those component heartbeats are upserted to `bot_heartbeat`.
+
 Run locally:
 
 ```bash
