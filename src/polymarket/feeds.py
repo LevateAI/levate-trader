@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -65,6 +66,18 @@ SUPPORTED_ASSET_ALIASES = {
     "SOL": ("sol", "solana"),
     "XRP": ("xrp", "ripple"),
 }
+UPDOWN_SLUG_PREFIXES = {
+    "BTC": "btc",
+    "ETH": "eth",
+    "SOL": "sol",
+    "XRP": "xrp",
+}
+UPDOWN_SEARCH_NAMES = {
+    "BTC": "Bitcoin",
+    "ETH": "Ethereum",
+    "SOL": "Solana",
+    "XRP": "XRP",
+}
 WINDOW_RE = re.compile(
     r"(?:(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
     r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?|tember)?|oct(?:ober)?|"
@@ -73,6 +86,27 @@ WINDOW_RE = re.compile(
     r"(?P<end>\d{1,2}:\d{2}\s*(?:am|pm)?)\s*et\b",
     re.IGNORECASE,
 )
+
+
+@dataclass(slots=True)
+class _DiscoveryDiagnostics:
+    """One raw Gamma market payload's filter diagnostics."""
+
+    asset_matched: bool = False
+    keyword_matched: bool = False
+    title_matched: bool = False
+    active: bool = False
+    order_book_enabled: bool = False
+    horizon_derived: bool = False
+    kept: bool = False
+    reject_reason: str | None = None
+    asset_symbol: str | None = None
+    horizon: str | None = None
+    window_seconds: int | None = None
+    window_open_source: str | None = None
+    window_open_time: datetime | None = None
+    resolution_time: datetime | None = None
+    derived_window_seconds: int | None = None
 
 
 class FeedUnavailableError(RuntimeError):
@@ -169,18 +203,142 @@ class PolymarketClobClient:
         self.watchdog.mark_message_received()
         markets: list[PolymarketMarket] = []
         seen_market_ids: set[str] = set()
+        rejection_counts: dict[str, int] = {}
+        title_matched_count = 0
+        horizon_derived_count = 0
         for item in payloads:
+            diagnostics = _market_payload_diagnostics(item, keywords)
+            if diagnostics.title_matched:
+                title_matched_count += 1
+            if diagnostics.horizon_derived:
+                horizon_derived_count += 1
             market = _market_from_payload(item, keywords, self._fee_rate_crypto)
             if market is not None and market.market_id not in seen_market_ids:
                 seen_market_ids.add(market.market_id)
                 markets.append(market)
-            if len(markets) >= limit:
-                break
+            elif market is None:
+                reject_reason = diagnostics.reject_reason or "unknown"
+                rejection_counts[reject_reason] = rejection_counts.get(reject_reason, 0) + 1
+                logger.debug(
+                    "polymarket_market_filter_rejected",
+                    reason=reject_reason,
+                    market_id=item.get("id") or item.get("conditionId"),
+                    slug=item.get("slug") or item.get("_event_slug"),
+                    question=item.get("question") or item.get("_event_title"),
+                    asset_symbol=diagnostics.asset_symbol,
+                    title_matched=diagnostics.title_matched,
+                    resolution_time=(
+                        diagnostics.resolution_time.isoformat()
+                        if diagnostics.resolution_time is not None
+                        else None
+                    ),
+                    window_open_time=(
+                        diagnostics.window_open_time.isoformat()
+                        if diagnostics.window_open_time is not None
+                        else None
+                    ),
+                    window_open_source=diagnostics.window_open_source,
+                    derived_window_seconds=diagnostics.derived_window_seconds,
+                )
+        logger.info(
+            "polymarket_market_discovery_filter_counts",
+            fetched=len(payloads),
+            title_matched=title_matched_count,
+            horizon_derived=horizon_derived_count,
+            kept=len(markets),
+            rejection_counts=rejection_counts,
+        )
         logger.info("polymarket_crypto_markets_loaded", count=len(markets))
         return markets
 
     async def _fetch_market_payloads(self, keywords: list[str], limit: int) -> list[dict[str, Any]]:
         """Fetch raw market payloads from events first, then legacy fallbacks."""
+        current_payloads = await self._fetch_current_updown_payloads()
+        search_payloads = await self._fetch_public_search_payloads(keywords, limit)
+        payloads = [*current_payloads, *search_payloads]
+        if not payloads:
+            payloads = await self._fetch_global_event_payloads(limit)
+        logger.info(
+            "polymarket_market_fetch_source_counts",
+            current_slug_count=len(current_payloads),
+            public_search_count=len(search_payloads),
+            fallback_event_count=max(
+                len(payloads) - len(current_payloads) - len(search_payloads),
+                0,
+            ),
+            total_count=len(payloads),
+        )
+        raw_log_limit = min(len(payloads), 50)
+        for sample_index, item in enumerate(payloads[:raw_log_limit]):
+            logger.info(
+                "polymarket_raw_market_payload",
+                sample_index=sample_index,
+                sample_limit=raw_log_limit,
+                payload=item,
+            )
+        return _dedupe_payloads(payloads)
+
+    async def _fetch_current_updown_payloads(self) -> list[dict[str, Any]]:
+        """Fetch deterministic current/next short-window markets by slug."""
+        slugs = _candidate_updown_slugs(datetime.now(tz=UTC))
+        tasks = [self._fetch_markets_by_slug(slug) for slug in slugs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        payloads: list[dict[str, Any]] = []
+        for slug, result in zip(slugs, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "polymarket_current_slug_fetch_failed",
+                    slug=slug,
+                    error_type=type(result).__name__,
+                    error_message=str(result),
+                )
+                continue
+            for payload in result:
+                payload["_discovery_source"] = "current_slug"
+                payloads.append(payload)
+        return payloads
+
+    async def _fetch_markets_by_slug(self, slug: str) -> list[dict[str, Any]]:
+        response = await self._client.get(
+            f"{self._gamma_url}/markets",
+            params={"slug": slug},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def _fetch_public_search_payloads(
+        self,
+        keywords: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for query in _updown_search_queries(keywords):
+            response = await self._client.get(
+                f"{self._gamma_url}/public-search",
+                params={"q": query, "limit": max(limit, 10)},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                continue
+            for event in data.get("events") or []:
+                if not isinstance(event, dict):
+                    continue
+                for market in event.get("markets") or []:
+                    if isinstance(market, dict):
+                        payload = dict(market)
+                        payload["_event_slug"] = str(event.get("slug") or "")
+                        payload["_event_title"] = str(
+                            event.get("title") or event.get("question") or ""
+                        )
+                        payload["_discovery_source"] = "public_search"
+                        payload["_search_query"] = query
+                        payloads.append(payload)
+        return payloads
+
+    async def _fetch_global_event_payloads(self, limit: int) -> list[dict[str, Any]]:
+        """Fetch raw market payloads from global events as a last-resort fallback."""
         payloads: list[dict[str, Any]] = []
         response = await self._client.get(
             f"{self._gamma_url}/events",
@@ -212,40 +370,9 @@ class PolymarketClobClient:
                     payload = dict(market)
                     payload["_event_slug"] = event_slug
                     payload["_event_title"] = event_title
+                    payload["_discovery_source"] = "global_events"
                     payloads.append(payload)
-        for keyword in keywords:
-            response = await self._client.get(
-                f"{self._gamma_url}/public-search",
-                params={"q": keyword, "limit": max(limit, 10)},
-            )
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, dict):
-                for event in data.get("events") or []:
-                    if isinstance(event, dict):
-                        for market in event.get("markets") or []:
-                            if isinstance(market, dict):
-                                payload = dict(market)
-                                payload["_event_slug"] = str(event.get("slug") or "")
-                                payload["_event_title"] = str(
-                                    event.get("title") or event.get("question") or ""
-                                )
-                                payloads.append(payload)
-        if payloads:
-            return payloads
-
-        response = await self._client.get(
-            f"{self._gamma_url}/markets",
-            params={
-                "active": "true",
-                "closed": "false",
-                "archived": "false",
-                "limit": max(limit * 25, 100),
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+        return payloads
 
     async def fetch_order_book(
         self,
@@ -416,14 +543,56 @@ class CoinbaseSpotClient:
         )
 
 
-def _market_from_payload(
-    item: dict[str, Any],
-    keywords: list[str],
-    fee_rate_crypto: float,
-) -> PolymarketMarket | None:
-    question = str(item.get("question") or "")
-    slug = str(item.get("slug") or item.get("_event_slug") or "")
-    searchable = " ".join(
+def _candidate_updown_slugs(now: datetime) -> list[str]:
+    """Return deterministic current and near-future recurring Up/Down market slugs."""
+    timestamp = int(now.timestamp())
+    slugs: list[str] = []
+    for horizon, window_seconds in SHORT_HORIZON_SECONDS.items():
+        current_window_start = timestamp // window_seconds * window_seconds
+        for offset in range(3):
+            window_start = current_window_start + offset * window_seconds
+            for prefix in UPDOWN_SLUG_PREFIXES.values():
+                slugs.append(f"{prefix}-updown-{horizon}-{window_start}")
+    return slugs
+
+
+def _updown_search_queries(keywords: list[str]) -> list[str]:
+    """Return targeted public-search queries for enabled crypto Up/Down assets."""
+    normalized_keywords = {keyword.lower() for keyword in keywords}
+    queries: list[str] = []
+    for symbol, aliases in SUPPORTED_ASSET_ALIASES.items():
+        if normalized_keywords and not any(alias in normalized_keywords for alias in aliases):
+            continue
+        name = UPDOWN_SEARCH_NAMES[symbol]
+        prefix = UPDOWN_SLUG_PREFIXES[symbol]
+        queries.extend(
+            [
+                f"{name} Up or Down",
+                f"{prefix}-updown-5m",
+                f"{prefix}-updown-15m",
+            ]
+        )
+    return queries
+
+
+def _dedupe_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Dedupe Gamma payloads while preserving source order."""
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for payload in payloads:
+        key = str(payload.get("conditionId") or payload.get("id") or payload.get("slug") or "")
+        if not key:
+            key = json.dumps(payload, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(payload)
+    return deduped
+
+
+def _payload_searchable_text(item: dict[str, Any]) -> str:
+    """Return normalized text used by discovery filters."""
+    return " ".join(
         str(item.get(key) or "")
         for key in (
             "question",
@@ -435,6 +604,94 @@ def _market_from_payload(
             "_event_title",
         )
     ).lower()
+
+
+def _market_payload_diagnostics(
+    item: dict[str, Any],
+    keywords: list[str],
+) -> _DiscoveryDiagnostics:
+    """Explain which discovery stage a raw Gamma market payload reached."""
+    diagnostics = _DiscoveryDiagnostics()
+    searchable = _payload_searchable_text(item)
+    diagnostics.asset_symbol = _asset_symbol_from_text(searchable)
+    diagnostics.asset_matched = diagnostics.asset_symbol is not None
+    if not diagnostics.asset_matched:
+        diagnostics.reject_reason = "asset_not_supported"
+        return diagnostics
+
+    normalized_keywords = [keyword.lower() for keyword in keywords]
+    diagnostics.keyword_matched = not normalized_keywords or any(
+        keyword in searchable for keyword in normalized_keywords
+    )
+    if not diagnostics.keyword_matched:
+        diagnostics.reject_reason = "keyword_not_matched"
+        return diagnostics
+
+    diagnostics.title_matched = _looks_like_up_down_market(searchable)
+    if not diagnostics.title_matched:
+        diagnostics.reject_reason = "not_up_down_title"
+        return diagnostics
+
+    diagnostics.order_book_enabled = item.get("enableOrderBook") is not False
+    if not diagnostics.order_book_enabled:
+        diagnostics.reject_reason = "order_book_disabled"
+        return diagnostics
+
+    diagnostics.active = not (
+        item.get("closed") or item.get("archived") or item.get("active") is False
+    )
+    if not diagnostics.active:
+        diagnostics.reject_reason = "inactive_or_closed"
+        return diagnostics
+
+    diagnostics.resolution_time = _maybe_timestamp(
+        item.get("endDate") or item.get("endDateIso") or item.get("umaEndDate")
+    )
+    if diagnostics.resolution_time is None:
+        diagnostics.reject_reason = "missing_resolution_time"
+        return diagnostics
+
+    window_open_meta = _window_open_meta_from_payload(
+        item,
+        searchable,
+        diagnostics.resolution_time,
+    )
+    if window_open_meta is None:
+        diagnostics.reject_reason = "missing_window_open"
+        return diagnostics
+    diagnostics.window_open_time, diagnostics.window_open_source = window_open_meta
+    diagnostics.derived_window_seconds = int(
+        round((diagnostics.resolution_time - diagnostics.window_open_time).total_seconds())
+    )
+    horizon_meta = _derive_short_horizon(
+        diagnostics.window_open_time,
+        diagnostics.resolution_time,
+    )
+    if horizon_meta is None:
+        diagnostics.reject_reason = "unsupported_window_length"
+        return diagnostics
+    diagnostics.horizon, diagnostics.window_seconds = horizon_meta
+    diagnostics.horizon_derived = True
+
+    token_ids = _json_list(item.get("clobTokenIds") or item.get("tokenIds"))
+    if len(token_ids) < 2:
+        diagnostics.reject_reason = "missing_token_ids"
+        return diagnostics
+    if item.get("id") is None and item.get("conditionId") is None:
+        diagnostics.reject_reason = "missing_market_id"
+        return diagnostics
+    diagnostics.kept = True
+    return diagnostics
+
+
+def _market_from_payload(
+    item: dict[str, Any],
+    keywords: list[str],
+    fee_rate_crypto: float,
+) -> PolymarketMarket | None:
+    question = str(item.get("question") or "")
+    slug = str(item.get("slug") or item.get("_event_slug") or "")
+    searchable = _payload_searchable_text(item)
     asset_symbol = _asset_symbol_from_text(searchable)
     if asset_symbol is None:
         return None
@@ -453,13 +710,28 @@ def _market_from_payload(
     )
     if resolution_time is None:
         return None
-    window_open_time = _window_open_from_payload(item, searchable, resolution_time)
-    if window_open_time is None:
+    window_open_meta = _window_open_meta_from_payload(item, searchable, resolution_time)
+    if window_open_meta is None:
         return None
+    window_open_time, window_open_source = window_open_meta
     horizon_meta = _derive_short_horizon(window_open_time, resolution_time)
     if horizon_meta is None:
         return None
     horizon, window_seconds = horizon_meta
+    logger.info(
+        "polymarket_market_window_derived",
+        market_id=item.get("id") or item.get("conditionId"),
+        slug=slug or item.get("_event_slug"),
+        question=question or item.get("_event_title"),
+        horizon=horizon,
+        window_seconds=window_seconds,
+        window_open_time=window_open_time.isoformat(),
+        window_open_source=window_open_source,
+        resolution_time=resolution_time.isoformat(),
+        derived_window_seconds=int(
+            round((resolution_time - window_open_time).total_seconds())
+        ),
+    )
 
     token_ids = _json_list(item.get("clobTokenIds") or item.get("tokenIds"))
     if len(token_ids) < 2:
@@ -495,7 +767,11 @@ def _asset_symbol_from_text(searchable: str) -> str | None:
 
 
 def _looks_like_up_down_market(searchable: str) -> bool:
-    return "up or down" in searchable or "updown" in searchable
+    return (
+        "up or down" in searchable
+        or "updown" in searchable
+        or re.search(r"\bup\s*-\s*down\b", searchable) is not None
+    )
 
 
 def _window_open_from_payload(
@@ -503,11 +779,23 @@ def _window_open_from_payload(
     searchable: str,
     resolution_time: datetime,
 ) -> datetime | None:
+    meta = _window_open_meta_from_payload(item, searchable, resolution_time)
+    return meta[0] if meta is not None else None
+
+
+def _window_open_meta_from_payload(
+    item: dict[str, Any],
+    searchable: str,
+    resolution_time: datetime,
+) -> tuple[datetime, str] | None:
+    text_open = _window_open_from_text(searchable, resolution_time)
+    if text_open is not None:
+        return text_open, "title_window"
     for key in ("startDate", "startDateIso", "startTime", "openTime", "windowStart"):
         parsed = _maybe_timestamp(item.get(key))
         if parsed is not None:
-            return parsed
-    return _window_open_from_text(searchable, resolution_time)
+            return parsed, key
+    return None
 
 
 def _window_open_from_text(text: str, resolution_time: datetime) -> datetime | None:

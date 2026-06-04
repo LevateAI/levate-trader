@@ -59,7 +59,15 @@ class PolymarketDataSynchronizer:
         )
         self._markets = [
             market for market in markets if self._horizon is None or market.horizon == self._horizon
-        ]
+        ][: self._max_markets]
+        logger.info(
+            "polymarket_markets_refreshed",
+            fetched_count=len(markets),
+            tracked_count=len(self._markets),
+            horizon=self._horizon,
+            market_ids=[market.market_id for market in self._markets],
+            slugs=[market.slug for market in self._markets],
+        )
         self._markets_loaded_at = now
 
     async def build_context(self, market: PolymarketMarket) -> PolymarketMarketContext | None:

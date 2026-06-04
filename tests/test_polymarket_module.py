@@ -9,7 +9,14 @@ from typing import Any
 
 import pytest
 
-from src.polymarket.feeds import FeedWatchdog, PolymarketClobClient, _levels, _market_from_payload
+from src.polymarket.feeds import (
+    FeedWatchdog,
+    PolymarketClobClient,
+    _candidate_updown_slugs,
+    _levels,
+    _market_from_payload,
+    _market_payload_diagnostics,
+)
 from src.polymarket.main import PolymarketComponentStaleError, PolymarketRuntime
 from src.polymarket.models import (
     CoinbaseSpotPrice,
@@ -274,6 +281,47 @@ def test_market_discovery_accepts_15m_crypto_windows() -> None:
     assert market is not None
     assert market.horizon == "15m"
     assert market.window_seconds == 900
+
+
+def test_market_discovery_uses_title_window_not_listing_start_date() -> None:
+    payload = {
+        "id": "2432516",
+        "conditionId": "condition-current",
+        "slug": "btc-updown-5m-1780616400",
+        "question": "Bitcoin Up or Down - June 4, 7:40PM-7:45PM ET",
+        "clobTokenIds": '["yes-token","no-token"]',
+        "enableOrderBook": True,
+        "active": True,
+        "closed": False,
+        "archived": False,
+        "endDate": "2026-06-04T23:45:00Z",
+        "startDate": "2026-06-03T23:47:19.4745Z",
+        "startDateIso": "2026-06-03",
+    }
+
+    market = _market_from_payload(payload, ["bitcoin", "btc"], 0.07)
+    diagnostics = _market_payload_diagnostics(payload, ["bitcoin", "btc"])
+
+    assert market is not None
+    assert market.horizon == "5m"
+    assert market.window_seconds == 300
+    assert market.window_open_time == datetime(2026, 6, 4, 23, 40, tzinfo=UTC)
+    assert diagnostics.window_open_source == "title_window"
+    assert diagnostics.derived_window_seconds == 300
+    assert diagnostics.kept is True
+
+
+def test_candidate_updown_slugs_cover_assets_and_horizons() -> None:
+    slugs = _candidate_updown_slugs(datetime(2026, 6, 4, 23, 44, 5, tzinfo=UTC))
+
+    assert "btc-updown-5m-1780616400" in slugs
+    assert "eth-updown-5m-1780616400" in slugs
+    assert "sol-updown-5m-1780616400" in slugs
+    assert "xrp-updown-5m-1780616400" in slugs
+    assert "btc-updown-15m-1780615800" in slugs
+    assert "eth-updown-15m-1780615800" in slugs
+    assert "sol-updown-15m-1780615800" in slugs
+    assert "xrp-updown-15m-1780615800" in slugs
 
 
 def test_polymarket_account_ids_are_coin_by_horizon_books() -> None:
