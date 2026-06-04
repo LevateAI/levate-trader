@@ -29,11 +29,13 @@ class PolymarketDataSynchronizer:
         keywords: list[str],
         max_markets: int = 10,
         market_refresh_sec: int = 300,
+        horizon: str | None = None,
     ) -> None:
         self._clob = clob_client
         self._coinbase = coinbase_client
         self._keywords = keywords
         self._max_markets = max_markets
+        self._horizon = horizon
         self._market_refresh = timedelta(seconds=market_refresh_sec)
         self._markets: list[PolymarketMarket] = []
         self._markets_loaded_at: datetime | None = None
@@ -51,17 +53,21 @@ class PolymarketDataSynchronizer:
             and now - self._markets_loaded_at < self._market_refresh
         ):
             return
-        self._markets = await self._clob.fetch_crypto_markets(
+        markets = await self._clob.fetch_crypto_markets(
             keywords=self._keywords,
             limit=self._max_markets,
         )
+        self._markets = [
+            market for market in markets if self._horizon is None or market.horizon == self._horizon
+        ]
         self._markets_loaded_at = now
 
     async def build_context(self, market: PolymarketMarket) -> PolymarketMarketContext | None:
         """Build one synchronized strategy context."""
-        books, spot = await asyncio.gather(
+        books, spot, live_price_to_beat = await asyncio.gather(
             self._clob.fetch_books_for_market(market),
             self._coinbase.fetch_spot(market.asset_symbol),
+            self._clob.fetch_price_to_beat(market),
         )
         yes_book, no_book = books
         yes_price = _snapshot_price(yes_book)
@@ -74,6 +80,10 @@ class PolymarketDataSynchronizer:
                 no_has_price=no_price is not None,
             )
             return None
+        price_to_beat = (
+            live_price_to_beat if live_price_to_beat is not None else market.reference_price
+        )
+        market.reference_price = price_to_beat
         timestamp = max(yes_book.timestamp, no_book.timestamp, spot.timestamp)
         snapshot = PolymarketMarketSnapshot(
             market_id=market.market_id,
@@ -87,9 +97,13 @@ class PolymarketDataSynchronizer:
                 yes_price=yes_price,
                 no_price=no_price,
                 coinbase_ref_price=spot.price,
-                market_reference_price=market.reference_price,
+                market_reference_price=price_to_beat,
             ),
             resolution_time=market.resolution_time,
+            horizon=market.horizon,
+            window_seconds=market.window_seconds,
+            seconds_to_resolution=_seconds_to_resolution(market.resolution_time, timestamp),
+            price_to_beat=price_to_beat,
             timestamp=timestamp,
         )
         return PolymarketMarketContext(
@@ -131,3 +145,9 @@ def _snapshot_price(book: PolymarketOrderBook) -> float | None:
 def _snapshot_depth(book: PolymarketOrderBook) -> float:
     """Return buyable depth when available, otherwise visible bid depth."""
     return book.ask_depth if book.ask_depth > 0 else book.bid_depth
+
+
+def _seconds_to_resolution(resolution_time: datetime | None, timestamp: datetime) -> int:
+    if resolution_time is None:
+        return 0
+    return max(int(round((resolution_time - timestamp).total_seconds())), 0)

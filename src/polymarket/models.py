@@ -77,10 +77,14 @@ class PolymarketMarket:
 
     market_id: str
     condition_id: str
+    slug: str | None
     question: str
     yes_token_id: str
     no_token_id: str
     asset_symbol: str
+    horizon: str
+    window_seconds: int
+    window_open_time: datetime
     resolution_time: datetime | None
     reference_price: float | None = None
     fees_enabled: bool = True
@@ -110,6 +114,10 @@ class PolymarketMarketSnapshot:
     coinbase_ref_price: float
     implied_gap: float
     resolution_time: datetime | None
+    horizon: str
+    window_seconds: int
+    seconds_to_resolution: int
+    price_to_beat: float | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
 
     def to_payload(self) -> dict[str, object]:
@@ -124,6 +132,12 @@ class PolymarketMarketSnapshot:
             "no_book_depth": round(self.no_book_depth, 4),
             "coinbase_ref_price": round(self.coinbase_ref_price, 2),
             "implied_gap": round(self.implied_gap, 4),
+            "horizon": self.horizon,
+            "window_seconds": self.window_seconds,
+            "seconds_to_resolution": self.seconds_to_resolution,
+            "price_to_beat": (
+                round(self.price_to_beat, 2) if self.price_to_beat is not None else None
+            ),
             "resolution_time": (
                 self.resolution_time.isoformat() if self.resolution_time is not None else None
             ),
@@ -148,6 +162,8 @@ class PolymarketPosition:
     account_id: str
     timestamp: datetime
     market_id: str
+    horizon: str
+    window_seconds: int
     side: PolymarketSide
     shares: float
     avg_entry_price: float
@@ -162,6 +178,8 @@ class PolymarketPosition:
         cls,
         account_id: str,
         market_id: str,
+        horizon: str,
+        window_seconds: int,
         side: PolymarketSide,
         shares: float,
         avg_entry_price: float,
@@ -173,6 +191,8 @@ class PolymarketPosition:
             account_id=account_id,
             timestamp=datetime.now(tz=UTC),
             market_id=market_id,
+            horizon=horizon,
+            window_seconds=window_seconds,
             side=side,
             shares=shares,
             avg_entry_price=avg_entry_price,
@@ -191,6 +211,8 @@ class PolymarketTrade:
     account_id: str
     timestamp: datetime
     market_id: str
+    horizon: str
+    window_seconds: int
     strategy_name: str
     side: PolymarketSide
     shares: float
@@ -208,6 +230,8 @@ class PolymarketTrade:
             "account_id": self.account_id,
             "timestamp": self.timestamp.isoformat(),
             "market_id": self.market_id,
+            "horizon": self.horizon,
+            "window_seconds": self.window_seconds,
             "strategy_name": self.strategy_name,
             "side": self.side.value,
             "shares": round(self.shares, 6),

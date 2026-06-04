@@ -47,9 +47,11 @@ class PolymarketRuntime:
         self.settings = settings or PolymarketSettings()  # type: ignore[call-arg]
         configure_logging(self.settings.log_level)
         self.stop_event = asyncio.Event()
+        self._asset_symbols = self.settings.enabled_asset_symbols
         self.clob = PolymarketClobClient(
             gamma_url=self.settings.polymarket_gamma_url,
             clob_url=self.settings.polymarket_clob_url,
+            polymarket_web_url=self.settings.polymarket_web_url,
             fee_rate_crypto=self.settings.polymarket_fee_rate_crypto,
             stale_threshold_sec=self.settings.polymarket_stale_threshold_sec,
         )
@@ -63,21 +65,42 @@ class PolymarketRuntime:
             keywords=self.settings.market_keywords,
             max_markets=self.settings.polymarket_max_markets,
             market_refresh_sec=self.settings.polymarket_market_refresh_sec,
+            horizon=self.settings.polymarket_horizon,
         )
-        self.repository = PolymarketRepository(self.settings)
-        self.executor = PolymarketPaperExecutor(
-            account_id=self.settings.polymarket_account_id,
-            starting_balance_usd=self.settings.polymarket_starting_balance_usd,
-            taker_fee_rate=self.settings.polymarket_fee_rate_crypto,
-            fees_enabled=True,
-        )
+        self.repositories = {
+            asset_symbol: PolymarketRepository(
+                self.settings,
+                account_id=self._account_id_for_asset(asset_symbol),
+            )
+            for asset_symbol in self._asset_symbols
+        }
+        self.executors = {
+            asset_symbol: PolymarketPaperExecutor(
+                account_id=self._account_id_for_asset(asset_symbol),
+                starting_balance_usd=self.settings.polymarket_starting_balance_usd,
+                taker_fee_rate=self.settings.polymarket_fee_rate_crypto,
+                fees_enabled=True,
+            )
+            for asset_symbol in self._asset_symbols
+        }
+        self._heartbeat_repository = self.repositories[self._asset_symbols[0]]
+        self._snapshot_repository = self.repositories[self._asset_symbols[0]]
+        self.repository = self._heartbeat_repository
+        self.executor = self.executors[self._asset_symbols[0]]
         self.volatility_tracker = CoinbaseVolatilityTracker(
             window_sec=self.settings.polymarket_vol_window_sec,
         )
         self.strategies = self._load_strategies()
         started_at_mono = time.monotonic()
         started_at_wall = datetime.now(tz=UTC)
-        self._heartbeat_components = HEARTBEAT_COMPONENTS
+        self._component_name = {
+            (asset_symbol, component): (
+                f"{self.settings.polymarket_horizon}_{asset_symbol.lower()}_{component}"
+            )
+            for asset_symbol in self._asset_symbols
+            for component in HEARTBEAT_COMPONENTS
+        }
+        self._heartbeat_components = tuple(self._component_name.values())
         self._last_success: dict[str, float] = {
             component: started_at_mono for component in self._heartbeat_components
         }
@@ -89,18 +112,30 @@ class PolymarketRuntime:
         }
         self._latest_contexts: dict[str, PolymarketMarketContext] = {}
 
+    def _account_id_for_asset(self, asset_symbol: str) -> str:
+        """Return the tournament book id for an asset in this horizon process."""
+        return f"{asset_symbol.lower()}_{self.settings.polymarket_horizon}"
+
+    def _display_name_for_asset(self, asset_symbol: str) -> str:
+        """Return a human-friendly account display name."""
+        return f"Polymarket {asset_symbol.upper()} {self.settings.polymarket_horizon}"
+
     async def run(self) -> None:
         """Run the Polymarket data layer until shutdown."""
         logger.warning(
             "polymarket_runtime_starting",
-            account_id=self.settings.polymarket_account_id,
-            paper_balance_usd=self.settings.polymarket_starting_balance_usd,
+            horizon=self.settings.polymarket_horizon,
+            account_ids=[
+                self._account_id_for_asset(asset_symbol) for asset_symbol in self._asset_symbols
+            ],
+            paper_balance_usd_per_asset=self.settings.polymarket_starting_balance_usd,
             real_money_enabled=False,
         )
-        await self.repository.ensure_account(
-            display_name=self.settings.polymarket_display_name,
-            starting_balance_usd=self.settings.polymarket_starting_balance_usd,
-        )
+        for asset_symbol, repository in self.repositories.items():
+            await repository.ensure_account(
+                display_name=self._display_name_for_asset(asset_symbol),
+                starting_balance_usd=self.settings.polymarket_starting_balance_usd,
+            )
         tasks = [
             asyncio.create_task(self._snapshot_loop(), name="polymarket-snapshot-loop"),
             asyncio.create_task(self._strategy_loop(), name="polymarket-strategy-loop"),
@@ -256,82 +291,122 @@ class PolymarketRuntime:
         contexts = await self.synchronizer.build_contexts()
         if not contexts:
             return
+        contexts_by_asset: dict[str, int] = {asset_symbol: 0 for asset_symbol in self._asset_symbols}
         for context in contexts:
-            await self.repository.insert_snapshot(context.snapshot)
+            asset_symbol = context.market.asset_symbol
+            if asset_symbol not in self.executors:
+                logger.warning(
+                    "polymarket_context_asset_not_enabled",
+                    asset_symbol=asset_symbol,
+                    market_id=context.market.market_id,
+                    horizon=context.market.horizon,
+                )
+                continue
+            await self._snapshot_repository.insert_snapshot(context.snapshot)
             self._latest_contexts[context.market.market_id] = context
             self.volatility_tracker.record_price(
-                asset_symbol=context.market.asset_symbol,
+                asset_symbol=asset_symbol,
                 price=context.snapshot.coinbase_ref_price,
                 timestamp=context.snapshot.timestamp,
             )
             await self._mark_open_positions(context)
-        self._mark_success(
-            "snapshot",
-            {
-                "context_count": len(contexts),
-                "open_position_count": len(self.executor.positions),
-            },
-        )
+            contexts_by_asset[asset_symbol] = contexts_by_asset.get(asset_symbol, 0) + 1
+        for asset_symbol, context_count in contexts_by_asset.items():
+            if context_count <= 0:
+                continue
+            executor = self.executors[asset_symbol]
+            self._mark_success(
+                "snapshot",
+                asset_symbol=asset_symbol,
+                detail={
+                    "context_count": context_count,
+                    "open_position_count": len(executor.positions),
+                },
+            )
 
     async def _strategy_iteration(self) -> None:
         contexts = list(self._latest_contexts.values())
         if not contexts:
             return
-        evaluated_count = 0
-        executed_count = 0
+        stats_by_asset: dict[str, dict[str, int]] = {
+            asset_symbol: {"context_count": 0, "evaluated_count": 0, "executed_count": 0}
+            for asset_symbol in self._asset_symbols
+        }
         feeds_fresh = self._feeds_fresh()
         if not feeds_fresh:
             return
         if feeds_fresh:
             for context in contexts:
-                evaluated_count += 1
+                asset_symbol = context.market.asset_symbol
+                if asset_symbol not in self.executors:
+                    continue
+                stats = stats_by_asset[asset_symbol]
+                stats["context_count"] += 1
+                stats["evaluated_count"] += 1
                 if await self._run_strategies_for_context(context):
-                    executed_count += 1
-        self._mark_success(
-            "strategy",
-            {
-                "context_count": len(contexts),
-                "evaluated_count": evaluated_count,
-                "executed_count": executed_count,
-                "feeds_fresh": feeds_fresh,
-            },
-        )
+                    stats["executed_count"] += 1
+        for asset_symbol, stats in stats_by_asset.items():
+            if stats["context_count"] <= 0:
+                continue
+            self._mark_success(
+                "strategy",
+                asset_symbol=asset_symbol,
+                detail={
+                    **stats,
+                    "feeds_fresh": feeds_fresh,
+                },
+            )
 
     async def _settlement_iteration(self) -> None:
         contexts = list(self._latest_contexts.values())
         if not contexts:
             return
-        settled_count = 0
+        stats_by_asset: dict[str, dict[str, int]] = {
+            asset_symbol: {"context_count": 0, "settled_count": 0}
+            for asset_symbol in self._asset_symbols
+        }
         feeds_fresh = self._feeds_fresh()
         if not feeds_fresh:
             return
         if feeds_fresh:
             for context in contexts:
+                asset_symbol = context.market.asset_symbol
+                if asset_symbol not in self.executors:
+                    continue
+                stats = stats_by_asset[asset_symbol]
+                stats["context_count"] += 1
                 if await self._settle_if_due(context):
-                    settled_count += 1
-        self._mark_success(
-            "settle",
-            {
-                "context_count": len(contexts),
-                "settled_count": settled_count,
-                "feeds_fresh": feeds_fresh,
-            },
-        )
+                    stats["settled_count"] += 1
+        for asset_symbol, stats in stats_by_asset.items():
+            if stats["context_count"] <= 0:
+                continue
+            self._mark_success(
+                "settle",
+                asset_symbol=asset_symbol,
+                detail={
+                    **stats,
+                    "feeds_fresh": feeds_fresh,
+                },
+            )
 
     async def _equity_iteration(self) -> None:
-        await self.repository.insert_equity_snapshot(
-            balance_usd=self.executor.balance_usd,
-            equity_usd=self.executor.equity_usd,
-            open_position_count=len(self.executor.positions),
-        )
-        self._mark_success(
-            "equity",
-            {
-                "balance_usd": self.executor.balance_usd,
-                "equity_usd": self.executor.equity_usd,
-                "open_position_count": len(self.executor.positions),
-            },
-        )
+        for asset_symbol in self._asset_symbols:
+            repository = self.repositories[asset_symbol]
+            executor = self.executors[asset_symbol]
+            await repository.insert_equity_snapshot(
+                balance_usd=executor.balance_usd,
+                equity_usd=executor.equity_usd,
+                open_position_count=len(executor.positions),
+            )
+            self._mark_success(
+                "equity",
+                asset_symbol=asset_symbol,
+                detail={
+                    "balance_usd": executor.balance_usd,
+                    "equity_usd": executor.equity_usd,
+                    "open_position_count": len(executor.positions),
+                },
+            )
 
     async def _watchdog_check_once(self) -> None:
         now_mono = time.monotonic()
@@ -346,7 +421,7 @@ class PolymarketRuntime:
                 "age_sec": round(age_sec, 2),
                 "stale_limit_seconds": self.settings.stale_limit_seconds,
             }
-            await self.repository.upsert_heartbeat(
+            await self._heartbeat_repository.upsert_heartbeat(
                 component=component,
                 last_ok_at=last_success_wall,
                 detail=detail,
@@ -365,10 +440,23 @@ class PolymarketRuntime:
                 f"Polymarket component stale: {stale_component} age={stale_age:.2f}s"
             )
 
-    def _mark_success(self, component: str, detail: dict[str, Any] | None = None) -> None:
-        self._last_success[component] = time.monotonic()
-        self._last_success_wall[component] = datetime.now(tz=UTC)
-        self._heartbeat_detail[component] = detail or {}
+    def _mark_success(
+        self,
+        component: str,
+        detail: dict[str, Any] | None = None,
+        asset_symbol: str | None = None,
+    ) -> None:
+        component_map = getattr(self, "_component_name", {})
+        if asset_symbol is None:
+            component_name = component_map.get(component, component)
+        else:
+            component_name = component_map.get(
+                (asset_symbol.upper(), component),
+                f"{getattr(self.settings, 'polymarket_horizon', '5m')}_{asset_symbol.lower()}_{component}",
+            )
+        self._last_success[component_name] = time.monotonic()
+        self._last_success_wall[component_name] = datetime.now(tz=UTC)
+        self._heartbeat_detail[component_name] = detail or {}
 
     def _load_strategies(self) -> list[PolymarketStrategy]:
         strategies: list[PolymarketStrategy] = []
@@ -399,40 +487,56 @@ class PolymarketRuntime:
     async def _run_strategies_for_context(self, context: PolymarketMarketContext) -> bool:
         if not self._feeds_fresh():
             return False
-        if self._market_has_open_position(context.market.market_id):
+        asset_symbol = context.market.asset_symbol
+        if asset_symbol not in self.executors:
+            return False
+        executor = self.executors[asset_symbol]
+        if self._market_has_open_position(context.market.market_id, asset_symbol):
             return False
         for strategy in self.strategies:
             signal_result = await strategy.on_context(
                 context=context,
-                account_equity=self.executor.equity_usd,
+                account_equity=executor.equity_usd,
                 volatility_tracker=self.volatility_tracker,
             )
             if signal_result is None:
                 continue
-            await self._execute_signal(signal_result)
+            await self._execute_signal(signal_result, asset_symbol)
             return True
         return False
 
-    async def _execute_signal(self, signal: PolymarketSignal) -> None:
-        trades = await self.executor.execute_signal(signal)
+    async def _execute_signal(self, signal: PolymarketSignal, asset_symbol: str) -> None:
+        executor = self.executors[asset_symbol]
+        repository = self.repositories[asset_symbol]
+        trades = await executor.execute_signal(signal)
         for trade in trades:
-            await self.repository.insert_trade(trade)
+            await repository.insert_trade(trade)
         for leg in signal.legs:
-            position = self.executor.positions.get((signal.market_id, leg.side))
+            position = executor.positions.get((signal.market_id, leg.side))
             if position is not None:
-                await self.repository.insert_position(position)
+                await repository.insert_position(position)
 
     async def _mark_open_positions(self, context: PolymarketMarketContext) -> None:
+        asset_symbol = context.market.asset_symbol
+        if asset_symbol not in self.executors:
+            return
+        executor = self.executors[asset_symbol]
+        repository = self.repositories[asset_symbol]
         for side, book in (
             (PolymarketSide.YES, context.yes_book),
             (PolymarketSide.NO, context.no_book),
         ):
-            await self.executor.mark_to_market(context.market.market_id, side, book)
-            position = self.executor.positions.get((context.market.market_id, side))
+            await executor.mark_to_market(context.market.market_id, side, book)
+            position = executor.positions.get((context.market.market_id, side))
             if position is not None:
-                await self.repository.insert_position(position)
+                await repository.insert_position(position)
 
     async def _settle_if_due(self, context: PolymarketMarketContext) -> bool:
+        asset_symbol = context.market.asset_symbol
+        if asset_symbol not in self.executors:
+            return False
+        executor = self.executors[asset_symbol]
+        repository = self.repositories[asset_symbol]
         resolution_time = context.market.resolution_time
         reference_price = context.market.reference_price
         if resolution_time is None or reference_price is None:
@@ -447,19 +551,20 @@ class PolymarketRuntime:
         )
         settled_any = False
         for side in (PolymarketSide.YES, PolymarketSide.NO):
-            if (context.market.market_id, side) not in self.executor.positions:
+            if (context.market.market_id, side) not in executor.positions:
                 continue
-            trade = await self.executor.settle_position(context.market.market_id, side, outcome)
-            await self.repository.insert_trade(trade)
-            if self.executor.closed_positions:
-                await self.repository.insert_position(self.executor.closed_positions[-1])
+            trade = await executor.settle_position(context.market.market_id, side, outcome)
+            await repository.insert_trade(trade)
+            if executor.closed_positions:
+                await repository.insert_position(executor.closed_positions[-1])
             settled_any = True
         return settled_any
 
-    def _market_has_open_position(self, market_id: str) -> bool:
+    def _market_has_open_position(self, market_id: str, asset_symbol: str) -> bool:
+        executor = self.executors[asset_symbol]
         return any(
             position_market_id == market_id
-            for position_market_id, _ in self.executor.positions
+            for position_market_id, _ in executor.positions
         )
 
     def _feeds_fresh(self) -> bool:

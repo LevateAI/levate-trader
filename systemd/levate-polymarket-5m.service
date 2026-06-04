@@ -1,5 +1,5 @@
 [Unit]
-Description=Levate Polymarket paper data bot
+Description=Levate Polymarket paper bot (5m)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,9 +7,10 @@ Wants=network-online.target
 Type=simple
 User=levateai
 WorkingDirectory=/home/levateai/levate-trader
-EnvironmentFile=/home/levateai/levate-trader/.env
+EnvironmentFile=/home/levateai/levate-trader/envs/polymarket_5m.env
+Environment=POLYMARKET_HORIZON=5m
 ExecStart=/home/levateai/levate-trader/.venv/bin/python -m src.polymarket.main
-Restart=always
+Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal

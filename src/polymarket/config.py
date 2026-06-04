@@ -16,14 +16,16 @@ class PolymarketSettings(BaseSettings):
         extra="ignore",
     )
 
-    polymarket_account_id: str = "polymarket_crypto"
+    polymarket_account_id: str = "btc_5m"
     polymarket_display_name: str = "Polymarket Crypto Arb"
+    polymarket_horizon: str = "5m"
+    polymarket_assets: str = "BTC,ETH,SOL,XRP"
     polymarket_starting_balance_usd: float = 500.0
     polymarket_poll_interval_sec: float = 2.0
     polymarket_market_refresh_sec: int = 300
     polymarket_stale_threshold_sec: int = 20
-    polymarket_max_markets: int = 10
-    polymarket_market_keywords: str = "bitcoin,btc,ethereum,eth"
+    polymarket_max_markets: int = 16
+    polymarket_market_keywords: str = "bitcoin,btc,ethereum,eth,solana,sol,xrp,ripple"
     polymarket_fee_rate_crypto: float = 0.07
     polymarket_strategies_enabled: str = "multi_outcome_sum_arb,latency_arb"
     polymarket_sum_arb_threshold: float = 0.02
@@ -37,6 +39,7 @@ class PolymarketSettings(BaseSettings):
 
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
+    polymarket_web_url: str = "https://polymarket.com"
     coinbase_exchange_url: str = "https://api.exchange.coinbase.com"
 
     supabase_url: AnyUrl
@@ -66,6 +69,15 @@ class PolymarketSettings(BaseSettings):
         if value < 0:
             raise ValueError("Polymarket fee rate cannot be negative")
         return value
+
+    @field_validator("polymarket_horizon")
+    @classmethod
+    def validate_horizon(cls, value: str) -> str:
+        """Validate supported Polymarket short-duration horizons."""
+        normalized = value.strip().lower()
+        if normalized not in {"5m", "15m"}:
+            raise ValueError("POLYMARKET_HORIZON must be '5m' or '15m'")
+        return normalized
 
     @field_validator(
         "polymarket_sum_arb_threshold",
@@ -97,3 +109,19 @@ class PolymarketSettings(BaseSettings):
             for name in self.polymarket_strategies_enabled.split(",")
             if name.strip()
         ]
+
+    @property
+    def enabled_asset_symbols(self) -> tuple[str, ...]:
+        """Return enabled crypto assets as uppercase symbols."""
+        assets = tuple(
+            asset.strip().upper()
+            for asset in self.polymarket_assets.split(",")
+            if asset.strip()
+        )
+        supported = {"BTC", "ETH", "SOL", "XRP"}
+        unsupported = sorted(set(assets) - supported)
+        if unsupported:
+            raise ValueError(f"Unsupported POLYMARKET_ASSETS values: {unsupported}")
+        if not assets:
+            raise ValueError("POLYMARKET_ASSETS must include at least one asset")
+        return assets

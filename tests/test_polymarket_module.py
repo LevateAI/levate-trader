@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from src.polymarket.feeds import FeedWatchdog
+from src.polymarket.feeds import FeedWatchdog, PolymarketClobClient, _levels, _market_from_payload
 from src.polymarket.main import PolymarketComponentStaleError, PolymarketRuntime
 from src.polymarket.models import (
     CoinbaseSpotPrice,
@@ -31,10 +31,14 @@ def _market() -> PolymarketMarket:
     return PolymarketMarket(
         market_id="market-1",
         condition_id="condition-1",
+        slug="btc-updown-5m-1780000000",
         question="Will Bitcoin be above $100,000 today?",
         yes_token_id="yes-token",
         no_token_id="no-token",
         asset_symbol="BTC",
+        horizon="5m",
+        window_seconds=300,
+        window_open_time=datetime(2026, 6, 1, 23, 54, tzinfo=UTC),
         resolution_time=datetime(2026, 6, 1, 23, 59, tzinfo=UTC),
         reference_price=100_000,
         fees_enabled=True,
@@ -81,6 +85,9 @@ def _context(
             coinbase_ref_price=spot,
             implied_gap=0,
             resolution_time=market.resolution_time,
+            horizon=market.horizon,
+            window_seconds=market.window_seconds,
+            seconds_to_resolution=300,
             timestamp=datetime.now(tz=UTC),
         ),
     )
@@ -88,11 +95,15 @@ def _context(
 
 @dataclass
 class FakeRepository:
+    snapshots: list[Any] = field(default_factory=list)
     trades: list[Any] = field(default_factory=list)
     positions: list[Any] = field(default_factory=list)
     equity_snapshots: list[dict[str, Any]] = field(default_factory=list)
     heartbeats: list[dict[str, Any]] = field(default_factory=list)
     fail_equity: bool = False
+
+    async def insert_snapshot(self, snapshot: Any) -> None:
+        self.snapshots.append(snapshot)
 
     async def insert_trade(self, trade: Any) -> None:
         self.trades.append(trade)
@@ -146,6 +157,9 @@ class FakeClob:
     ) -> tuple[PolymarketOrderBook, PolymarketOrderBook]:
         return self.yes_book, self.no_book
 
+    async def fetch_price_to_beat(self, market: PolymarketMarket) -> float | None:
+        return market.reference_price
+
 
 class FakeCoinbase:
     async def fetch_spot(self, asset_symbol: str) -> CoinbaseSpotPrice:
@@ -155,6 +169,196 @@ class FakeCoinbase:
             price=101_000,
             timestamp=datetime(2026, 6, 1, 12, 0, 1, tzinfo=UTC),
         )
+
+
+class MultiHorizonClob(FakeClob):
+    async def fetch_crypto_markets(self, keywords: list[str], limit: int) -> list[PolymarketMarket]:
+        five_min = _market()
+        fifteen_min = _market()
+        fifteen_min.market_id = "market-15m"
+        fifteen_min.condition_id = "condition-15m"
+        fifteen_min.horizon = "15m"
+        fifteen_min.window_seconds = 900
+        fifteen_min.window_open_time = datetime(2026, 6, 1, 23, 44, tzinfo=UTC)
+        return [five_min, fifteen_min]
+
+
+class FallbackPriceClob(PolymarketClobClient):
+    def __init__(self) -> None:
+        self.watchdog = FeedWatchdog("fallback-test")
+        self.best_price_calls: list[tuple[str, str]] = []
+
+    async def fetch_order_book(
+        self,
+        token_id: str,
+        market_id: str,
+        side: PolymarketSide,
+    ) -> PolymarketOrderBook:
+        return PolymarketOrderBook(
+            token_id=token_id,
+            market_id=market_id,
+            side=side,
+            timestamp=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+            bids=[PolymarketBookLevel(price=0.01, size=100)],
+            asks=[PolymarketBookLevel(price=0.99, size=100)],
+        )
+
+    async def fetch_best_price(self, token_id: str, side: str) -> float | None:
+        self.best_price_calls.append((token_id, side))
+        prices = {
+            ("yes-token", "BUY"): 0.54,
+            ("yes-token", "SELL"): 0.53,
+            ("no-token", "BUY"): 0.47,
+            ("no-token", "SELL"): 0.46,
+        }
+        return prices[(token_id, side)]
+
+
+def _window_payload(
+    asset: str,
+    alias: str,
+    start: str,
+    end: str,
+    resolution_time: str,
+) -> dict[str, Any]:
+    return {
+        "id": f"{asset.lower()}-market",
+        "conditionId": f"{asset.lower()}-condition",
+        "slug": f"{asset.lower()}-updown-1780000000",
+        "question": f"{alias} Up or Down - June 4, {start}-{end} ET",
+        "clobTokenIds": '["yes-token","no-token"]',
+        "enableOrderBook": True,
+        "active": True,
+        "closed": False,
+        "archived": False,
+        "endDate": resolution_time,
+    }
+
+
+def test_market_discovery_accepts_all_four_5m_crypto_assets() -> None:
+    payloads = {
+        "BTC": _window_payload("btc", "Bitcoin", "12:40PM", "12:45PM", "2026-06-04T16:45:00Z"),
+        "ETH": _window_payload("eth", "Ethereum", "12:40PM", "12:45PM", "2026-06-04T16:45:00Z"),
+        "SOL": _window_payload("sol", "Solana", "12:40PM", "12:45PM", "2026-06-04T16:45:00Z"),
+        "XRP": _window_payload("xrp", "XRP", "12:40PM", "12:45PM", "2026-06-04T16:45:00Z"),
+    }
+
+    markets = [
+        _market_from_payload(
+            payload,
+            ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "ripple"],
+            0.07,
+        )
+        for payload in payloads.values()
+    ]
+
+    assert [market.asset_symbol for market in markets if market is not None] == [
+        "BTC",
+        "ETH",
+        "SOL",
+        "XRP",
+    ]
+    assert all(market is not None and market.yes_token_id == "yes-token" for market in markets)
+    assert all(market is not None and market.no_token_id == "no-token" for market in markets)
+    assert all(market is not None and market.horizon == "5m" for market in markets)
+    assert all(market is not None and market.window_seconds == 300 for market in markets)
+
+
+def test_market_discovery_accepts_15m_crypto_windows() -> None:
+    market = _market_from_payload(
+        _window_payload("btc", "Bitcoin", "12:40PM", "12:55PM", "2026-06-04T16:55:00Z"),
+        ["bitcoin", "btc"],
+        0.07,
+    )
+
+    assert market is not None
+    assert market.horizon == "15m"
+    assert market.window_seconds == 900
+
+
+def test_polymarket_account_ids_are_coin_by_horizon_books() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.settings = SimpleNamespace(polymarket_horizon="15m")
+
+    assert [runtime._account_id_for_asset(asset) for asset in ("BTC", "ETH", "SOL", "XRP")] == [
+        "btc_15m",
+        "eth_15m",
+        "sol_15m",
+        "xrp_15m",
+    ]
+
+
+def test_horizon_is_derived_from_window_length_not_title_label() -> None:
+    payload = _window_payload(
+        "eth",
+        "Ethereum",
+        "12:40PM",
+        "12:55PM",
+        "2026-06-04T16:55:00Z",
+    )
+    payload["slug"] = "ethereum-short-duration-window-without-horizon-label"
+
+    market = _market_from_payload(payload, ["ethereum", "eth"], 0.07)
+
+    assert market is not None
+    assert market.horizon == "15m"
+    assert market.window_seconds == 900
+
+
+def test_snapshot_yes_no_prices_preserve_binary_probability_pair() -> None:
+    context = _context(
+        yes_book=_book(PolymarketSide.YES, asks=[(0.49, 100)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.51, 100)]),
+    )
+
+    assert context.snapshot.yes_price + context.snapshot.no_price == pytest.approx(1.0)
+
+
+def test_market_discovery_rejects_long_dated_milestone_markets() -> None:
+    payload = {
+        "id": "milestone-market",
+        "conditionId": "milestone-condition",
+        "slug": "will-bitcoin-hit-100k-in-june",
+        "question": "Will Bitcoin hit $100,000 in June?",
+        "clobTokenIds": '["yes-token","no-token"]',
+        "enableOrderBook": True,
+        "active": True,
+        "closed": False,
+        "archived": False,
+        "endDate": "2026-06-30T23:59:59Z",
+    }
+
+    market = _market_from_payload(payload, ["bitcoin", "btc"], 0.07)
+
+    assert market is None
+
+
+def test_book_levels_are_sorted_by_side() -> None:
+    payload = [
+        {"price": "0.52", "size": "5"},
+        {"price": "0.49", "size": "10"},
+        {"price": "0.51", "size": "7"},
+    ]
+
+    bids = _levels(payload, descending=True)
+    asks = _levels(payload, descending=False)
+
+    assert [level.price for level in bids] == [0.52, 0.51, 0.49]
+    assert [level.price for level in asks] == [0.49, 0.51, 0.52]
+
+
+@pytest.mark.asyncio
+async def test_book_pair_falls_back_to_live_prices_when_sanity_fails() -> None:
+    clob = FallbackPriceClob()
+
+    yes_book, no_book = await clob.fetch_books_for_market(_market())
+
+    assert yes_book.best_ask == pytest.approx(0.54)
+    assert yes_book.best_bid == pytest.approx(0.53)
+    assert no_book.best_ask == pytest.approx(0.47)
+    assert no_book.best_bid == pytest.approx(0.46)
+    assert yes_book.best_ask + no_book.best_ask == pytest.approx(1.01)
+    assert len(clob.best_price_calls) == 4
 
 
 @pytest.mark.asyncio
@@ -174,7 +378,32 @@ async def test_two_feed_synchronizer_produces_joined_snapshot() -> None:
     assert snapshot.yes_price == pytest.approx(0.62)
     assert snapshot.no_price == pytest.approx(0.4)
     assert snapshot.coinbase_ref_price == pytest.approx(101_000)
+    assert snapshot.price_to_beat == pytest.approx(100_000)
+    assert snapshot.horizon == "5m"
+    assert snapshot.window_seconds == 300
+    assert snapshot.seconds_to_resolution > 0
     assert snapshot.implied_gap == pytest.approx(-0.38)
+    payload = snapshot.to_payload()
+    assert payload["horizon"] == "5m"
+    assert payload["window_seconds"] == 300
+    assert payload["seconds_to_resolution"] > 0
+    assert payload["price_to_beat"] == pytest.approx(100_000)
+
+
+@pytest.mark.asyncio
+async def test_synchronizer_filters_markets_by_configured_horizon() -> None:
+    synchronizer = PolymarketDataSynchronizer(
+        clob_client=MultiHorizonClob(),  # type: ignore[arg-type]
+        coinbase_client=FakeCoinbase(),  # type: ignore[arg-type]
+        keywords=["bitcoin"],
+        max_markets=2,
+        horizon="15m",
+    )
+
+    await synchronizer.refresh_markets_if_needed()
+
+    assert [market.horizon for market in synchronizer.markets] == ["15m"]
+    assert [market.window_seconds for market in synchronizer.markets] == [900]
 
 
 @pytest.mark.asyncio
@@ -199,6 +428,10 @@ async def test_paper_buying_shares_respects_book_depth() -> None:
     assert trade.shares == pytest.approx(15)
     assert position.shares == pytest.approx(15)
     assert position.avg_entry_price == pytest.approx((0.62 * 10 + 0.63 * 5) / 15)
+    assert trade.to_payload()["horizon"] == "5m"
+    assert trade.to_payload()["window_seconds"] == 300
+    assert position.horizon == "5m"
+    assert position.window_seconds == 300
 
 
 @pytest.mark.asyncio
@@ -380,6 +613,8 @@ async def test_polymarket_runtime_halts_strategies_when_feed_is_stale() -> None:
     )
     runtime.executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
     runtime.repository = FakeRepository()
+    runtime.executors = {"BTC": runtime.executor}
+    runtime.repositories = {"BTC": runtime.repository}
     runtime.volatility_tracker = CoinbaseVolatilityTracker()
     runtime.strategies = [MultiOutcomeSumArbitrageStrategy(threshold=0.02, max_account_pct=0.10)]
     context = _context(
@@ -396,54 +631,60 @@ async def test_polymarket_runtime_halts_strategies_when_feed_is_stale() -> None:
 @pytest.mark.asyncio
 async def test_equity_success_is_marked_only_after_db_write_succeeds() -> None:
     runtime = object.__new__(PolymarketRuntime)
-    runtime.executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
-    runtime.repository = FakeRepository()
-    runtime._last_success = {"equity": 1.0}
-    runtime._last_success_wall = {"equity": datetime(2026, 6, 1, tzinfo=UTC)}
-    runtime._heartbeat_detail = {"equity": {"state": "old"}}
+    runtime.settings = SimpleNamespace(polymarket_horizon="5m")
+    repository = FakeRepository()
+    executor = PolymarketPaperExecutor("btc_5m", fees_enabled=False)
+    runtime._asset_symbols = ("BTC",)
+    runtime.executors = {"BTC": executor}
+    runtime.repositories = {"BTC": repository}
+    runtime._component_name = {("BTC", "equity"): "5m_btc_equity"}
+    runtime._last_success = {"5m_btc_equity": 1.0}
+    runtime._last_success_wall = {"5m_btc_equity": datetime(2026, 6, 1, tzinfo=UTC)}
+    runtime._heartbeat_detail = {"5m_btc_equity": {"state": "old"}}
 
     await runtime._equity_iteration()
 
-    assert runtime.repository.equity_snapshots
-    assert runtime._last_success["equity"] > 1.0
-    assert runtime._heartbeat_detail["equity"]["open_position_count"] == 0
+    assert repository.equity_snapshots
+    assert runtime._last_success["5m_btc_equity"] > 1.0
+    assert runtime._heartbeat_detail["5m_btc_equity"]["open_position_count"] == 0
 
-    last_success = runtime._last_success["equity"]
-    runtime.repository.fail_equity = True
+    last_success = runtime._last_success["5m_btc_equity"]
+    repository.fail_equity = True
 
     with pytest.raises(RuntimeError, match="equity insert failed"):
         await runtime._equity_iteration()
 
-    assert runtime._last_success["equity"] == last_success
+    assert runtime._last_success["5m_btc_equity"] == last_success
 
 
 @pytest.mark.asyncio
 async def test_polymarket_watchdog_upserts_and_raises_on_stale_component() -> None:
     runtime = object.__new__(PolymarketRuntime)
     runtime.settings = SimpleNamespace(stale_limit_seconds=1)
-    runtime.repository = FakeRepository()
-    runtime._heartbeat_components = ("snapshot", "equity")
+    repository = FakeRepository()
+    runtime._heartbeat_repository = repository
+    runtime._heartbeat_components = ("5m_btc_snapshot", "5m_btc_equity")
     runtime._last_success = {
-        "snapshot": time.monotonic() - 2,
-        "equity": time.monotonic(),
+        "5m_btc_snapshot": time.monotonic() - 2,
+        "5m_btc_equity": time.monotonic(),
     }
     runtime._last_success_wall = {
-        "snapshot": datetime.now(tz=UTC) - timedelta(seconds=2),
-        "equity": datetime.now(tz=UTC),
+        "5m_btc_snapshot": datetime.now(tz=UTC) - timedelta(seconds=2),
+        "5m_btc_equity": datetime.now(tz=UTC),
     }
     runtime._heartbeat_detail = {
-        "snapshot": {"context_count": 1},
-        "equity": {"open_position_count": 0},
+        "5m_btc_snapshot": {"context_count": 1},
+        "5m_btc_equity": {"open_position_count": 0},
     }
 
-    with pytest.raises(PolymarketComponentStaleError, match="snapshot"):
+    with pytest.raises(PolymarketComponentStaleError, match="5m_btc_snapshot"):
         await runtime._watchdog_check_once()
 
-    assert [row["component"] for row in runtime.repository.heartbeats] == [
-        "snapshot",
-        "equity",
+    assert [row["component"] for row in repository.heartbeats] == [
+        "5m_btc_snapshot",
+        "5m_btc_equity",
     ]
-    assert runtime.repository.heartbeats[0]["detail"]["age_sec"] >= 1
+    assert repository.heartbeats[0]["detail"]["age_sec"] >= 1
 
 
 @pytest.mark.asyncio
@@ -463,11 +704,13 @@ async def test_polymarket_task_supervisor_propagates_worker_failure() -> None:
 @pytest.mark.asyncio
 async def test_runtime_settlement_writes_resolved_trade_and_position() -> None:
     runtime = object.__new__(PolymarketRuntime)
-    runtime.executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
-    runtime.repository = FakeRepository()
+    repository = FakeRepository()
+    executor = PolymarketPaperExecutor("btc_5m", fees_enabled=False)
+    runtime.executors = {"BTC": executor}
+    runtime.repositories = {"BTC": repository}
     market = _market()
     market.resolution_time = datetime.now(tz=UTC) - timedelta(seconds=1)
-    await runtime.executor.open_position(
+    await executor.open_position(
         market.market_id,
         PolymarketSide.YES,
         10,
@@ -480,5 +723,35 @@ async def test_runtime_settlement_writes_resolved_trade_and_position() -> None:
     settled = await runtime._settle_if_due(context)
 
     assert settled is True
-    assert runtime.repository.trades[-1].pnl_usd == pytest.approx(10 * (1 - 0.62))
-    assert runtime.repository.positions[-1].status == "resolved"
+    assert repository.trades[-1].pnl_usd == pytest.approx(10 * (1 - 0.62))
+    assert repository.positions[-1].status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_runtime_routes_trades_to_coin_horizon_book() -> None:
+    runtime = object.__new__(PolymarketRuntime)
+    runtime.settings = SimpleNamespace(polymarket_stale_threshold_sec=20)
+    runtime.clob = SimpleNamespace(watchdog=SimpleNamespace(last_message_at=time.monotonic()))
+    runtime.coinbase = SimpleNamespace(watchdog=SimpleNamespace(last_message_at=time.monotonic()))
+    btc_repository = FakeRepository()
+    eth_repository = FakeRepository()
+    runtime.executors = {
+        "BTC": PolymarketPaperExecutor("btc_5m", fees_enabled=False),
+        "ETH": PolymarketPaperExecutor("eth_5m", fees_enabled=False),
+    }
+    runtime.repositories = {"BTC": btc_repository, "ETH": eth_repository}
+    runtime.volatility_tracker = CoinbaseVolatilityTracker()
+    runtime.strategies = [MultiOutcomeSumArbitrageStrategy(threshold=0.02, max_account_pct=0.10)]
+    context = _context(
+        yes_book=_book(PolymarketSide.YES, asks=[(0.45, 30)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.45, 30)]),
+    )
+
+    executed = await runtime._run_strategies_for_context(context)
+
+    assert executed is True
+    assert btc_repository.trades
+    assert not eth_repository.trades
+    assert {trade.account_id for trade in btc_repository.trades} == {"btc_5m"}
+    assert all(trade.horizon == "5m" for trade in btc_repository.trades)
+    assert all(trade.window_seconds == 300 for trade in btc_repository.trades)

@@ -22,8 +22,8 @@ logger = structlog.get_logger(__name__)
 class PolymarketRepository:
     """Persistence gateway for Polymarket paper-trading tables."""
 
-    def __init__(self, settings: PolymarketSettings) -> None:
-        self._account_id = settings.polymarket_account_id
+    def __init__(self, settings: PolymarketSettings, account_id: str | None = None) -> None:
+        self._account_id = account_id or settings.polymarket_account_id
         self._client: Client = create_client(
             str(settings.supabase_url),
             settings.supabase_service_key,
@@ -55,6 +55,8 @@ class PolymarketRepository:
             "account_id": self._account_id,
             "timestamp": position.timestamp.isoformat(),
             "market_id": position.market_id,
+            "horizon": position.horizon,
+            "window_seconds": position.window_seconds,
             "side": position.side.value,
             "shares": round(position.shares, 6),
             "avg_entry_price": round(position.avg_entry_price, 4),

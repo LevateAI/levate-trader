@@ -24,8 +24,9 @@ class PolymarketSignal:
 
     strategy_name: str
     market_id: str
+    horizon: str
+    window_seconds: int
     reason_entry: str
     risk_profile: str
     legs: list[PolymarketSignalLeg]
     features: dict[str, Any] = field(default_factory=dict)
-

@@ -141,6 +141,8 @@ class MultiOutcomeSumArbitrageStrategy:
         return PolymarketSignal(
             strategy_name=self.name,
             market_id=context.market.market_id,
+            horizon=context.market.horizon,
+            window_seconds=context.market.window_seconds,
             reason_entry=reason,
             risk_profile="guaranteed_if_both_legs_fill",
             legs=[
@@ -250,6 +252,8 @@ class LatencyArbStrategy:
         return PolymarketSignal(
             strategy_name=self.name,
             market_id=context.market.market_id,
+            horizon=context.market.horizon,
+            window_seconds=context.market.window_seconds,
             reason_entry=reason,
             risk_profile="probabilistic_latency_edge",
             legs=[

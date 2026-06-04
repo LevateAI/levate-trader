@@ -61,6 +61,8 @@ class PolymarketPaperExecutor:
                 order_book=leg.order_book,
                 strategy_name=signal.strategy_name,
                 reason_entry=signal.reason_entry,
+                horizon=signal.horizon,
+                window_seconds=signal.window_seconds,
             )
             trades.append(trade)
         return trades
@@ -73,6 +75,8 @@ class PolymarketPaperExecutor:
         order_book: PolymarketOrderBook,
         strategy_name: str,
         reason_entry: str,
+        horizon: str = "5m",
+        window_seconds: int = 300,
     ) -> PolymarketTrade:
         """Buy shares from the ask book, filling only available depth."""
         if requested_shares <= 0:
@@ -106,6 +110,8 @@ class PolymarketPaperExecutor:
             position = PolymarketPosition.open(
                 account_id=self.account_id,
                 market_id=market_id,
+                horizon=horizon,
+                window_seconds=window_seconds,
                 side=side,
                 shares=filled_shares,
                 avg_entry_price=avg_entry_price,
@@ -126,6 +132,8 @@ class PolymarketPaperExecutor:
             account_id=self.account_id,
             timestamp=datetime.now(tz=UTC),
             market_id=market_id,
+            horizon=horizon,
+            window_seconds=window_seconds,
             strategy_name=strategy_name,
             side=side,
             shares=filled_shares,
@@ -207,6 +215,8 @@ class PolymarketPaperExecutor:
             account_id=self.account_id,
             timestamp=datetime.now(tz=UTC),
             market_id=market_id,
+            horizon=position.horizon,
+            window_seconds=position.window_seconds,
             strategy_name="paper_manual",
             side=side,
             shares=filled_shares,
@@ -253,6 +263,8 @@ class PolymarketPaperExecutor:
             account_id=self.account_id,
             timestamp=datetime.now(tz=UTC),
             market_id=market_id,
+            horizon=position.horizon,
+            window_seconds=position.window_seconds,
             strategy_name="paper_resolution",
             side=side,
             shares=position.shares,

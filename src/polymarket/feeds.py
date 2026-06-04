@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -23,8 +24,55 @@ from src.polymarket.models import (
 
 logger = structlog.get_logger(__name__)
 
-COINBASE_PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
+COINBASE_PRODUCTS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+}
 DEFAULT_CRYPTO_TAKER_FEE_RATE = 0.07
+EASTERN_TZ = ZoneInfo("America/New_York")
+SHORT_HORIZON_SECONDS = {"5m": 300, "15m": 900}
+MONTH_NUMBERS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+SUPPORTED_ASSET_ALIASES = {
+    "BTC": ("btc", "bitcoin"),
+    "ETH": ("eth", "ethereum"),
+    "SOL": ("sol", "solana"),
+    "XRP": ("xrp", "ripple"),
+}
+WINDOW_RE = re.compile(
+    r"(?:(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?|tember)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\s+(?P<day>\d{1,2}),?\s+)?"
+    r"(?P<start>\d{1,2}:\d{2}\s*(?:am|pm)?)\s*-\s*"
+    r"(?P<end>\d{1,2}:\d{2}\s*(?:am|pm)?)\s*et\b",
+    re.IGNORECASE,
+)
 
 
 class FeedUnavailableError(RuntimeError):
@@ -80,12 +128,14 @@ class PolymarketClobClient:
         self,
         gamma_url: str = "https://gamma-api.polymarket.com",
         clob_url: str = "https://clob.polymarket.com",
+        polymarket_web_url: str = "https://polymarket.com",
         fee_rate_crypto: float = DEFAULT_CRYPTO_TAKER_FEE_RATE,
         stale_threshold_sec: int = 20,
         timeout_sec: float = 10.0,
     ) -> None:
         self._gamma_url = gamma_url.rstrip("/")
         self._clob_url = clob_url.rstrip("/")
+        self._polymarket_web_url = polymarket_web_url.rstrip("/")
         self._fee_rate_crypto = fee_rate_crypto
         self._timeout_sec = timeout_sec
         self._client = httpx.AsyncClient(timeout=timeout_sec)
@@ -105,7 +155,7 @@ class PolymarketClobClient:
         keywords: list[str],
         limit: int = 10,
     ) -> list[PolymarketMarket]:
-        """Fetch active CLOB-enabled BTC/ETH markets from Gamma."""
+        """Fetch active CLOB-enabled 5-minute BTC/ETH/SOL/XRP markets from Gamma."""
         try:
             payloads = await self._fetch_market_payloads(keywords, limit)
         except (httpx.HTTPError, ValueError) as exc:
@@ -130,8 +180,39 @@ class PolymarketClobClient:
         return markets
 
     async def _fetch_market_payloads(self, keywords: list[str], limit: int) -> list[dict[str, Any]]:
-        """Fetch raw market payloads from public-search, falling back to /markets."""
+        """Fetch raw market payloads from events first, then legacy fallbacks."""
         payloads: list[dict[str, Any]] = []
+        response = await self._client.get(
+            f"{self._gamma_url}/events",
+            params={
+                "active": "true",
+                "closed": "false",
+                "archived": "false",
+                "order": "volume_24hr",
+                "ascending": "false",
+                "limit": max(limit * 25, 100),
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        events = (
+            data
+            if isinstance(data, list)
+            else data.get("events")
+            if isinstance(data, dict)
+            else []
+        )
+        for event in events or []:
+            if not isinstance(event, dict):
+                continue
+            event_slug = str(event.get("slug") or "")
+            event_title = str(event.get("title") or event.get("question") or "")
+            for market in event.get("markets") or []:
+                if isinstance(market, dict):
+                    payload = dict(market)
+                    payload["_event_slug"] = event_slug
+                    payload["_event_title"] = event_title
+                    payloads.append(payload)
         for keyword in keywords:
             response = await self._client.get(
                 f"{self._gamma_url}/public-search",
@@ -144,7 +225,12 @@ class PolymarketClobClient:
                     if isinstance(event, dict):
                         for market in event.get("markets") or []:
                             if isinstance(market, dict):
-                                payloads.append(market)
+                                payload = dict(market)
+                                payload["_event_slug"] = str(event.get("slug") or "")
+                                payload["_event_title"] = str(
+                                    event.get("title") or event.get("question") or ""
+                                )
+                                payloads.append(payload)
         if payloads:
             return payloads
 
@@ -191,9 +277,63 @@ class PolymarketClobClient:
             market_id=market_id,
             side=side,
             timestamp=_parse_timestamp(payload.get("timestamp")),
-            bids=_levels(payload.get("bids")),
-            asks=_levels(payload.get("asks")),
+            bids=_levels(payload.get("bids"), descending=True),
+            asks=_levels(payload.get("asks"), descending=False),
         )
+
+    async def fetch_best_price(self, token_id: str, side: str) -> float | None:
+        """Fetch live CLOB best price for a token side; BUY is ask, SELL is bid."""
+        normalized_side = side.upper()
+        try:
+            response = await self._client.get(
+                f"{self._clob_url}/price",
+                params={"token_id": token_id, "side": normalized_side},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            price = _price_from_payload(payload)
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            logger.warning(
+                "polymarket_best_price_fetch_failed",
+                token_id=token_id,
+                side=normalized_side,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            return None
+        self.watchdog.mark_message_received()
+        return price
+
+    async def fetch_price_to_beat(self, market: PolymarketMarket) -> float | None:
+        """Fetch the official per-window price-to-beat, falling back to parsed strike."""
+        if not market.slug:
+            return market.reference_price
+        try:
+            response = await self._client.get(
+                f"{self._polymarket_web_url}/api/equity/price-to-beat/{market.slug}"
+            )
+            response.raise_for_status()
+            payload = response.json()
+            price_to_beat = _price_to_beat_from_payload(payload)
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            logger.warning(
+                "polymarket_price_to_beat_fetch_failed",
+                market_id=market.market_id,
+                slug=market.slug,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            return market.reference_price
+        if price_to_beat is None:
+            return market.reference_price
+        self.watchdog.mark_message_received()
+        logger.info(
+            "polymarket_price_to_beat_fetched",
+            market_id=market.market_id,
+            slug=market.slug,
+            price_to_beat=price_to_beat,
+        )
+        return price_to_beat
 
     async def fetch_books_for_market(
         self,
@@ -204,6 +344,23 @@ class PolymarketClobClient:
             self.fetch_order_book(market.yes_token_id, market.market_id, PolymarketSide.YES),
             self.fetch_order_book(market.no_token_id, market.market_id, PolymarketSide.NO),
         )
+        if _book_pair_needs_price_fallback(yes_book, no_book):
+            logger.warning(
+                "polymarket_book_pair_sanity_failed",
+                market_id=market.market_id,
+                yes_bid=yes_book.best_bid,
+                yes_ask=yes_book.best_ask,
+                no_bid=no_book.best_bid,
+                no_ask=no_book.best_ask,
+            )
+            yes_buy, yes_sell, no_buy, no_sell = await asyncio.gather(
+                self.fetch_best_price(market.yes_token_id, "BUY"),
+                self.fetch_best_price(market.yes_token_id, "SELL"),
+                self.fetch_best_price(market.no_token_id, "BUY"),
+                self.fetch_best_price(market.no_token_id, "SELL"),
+            )
+            yes_book = _book_with_live_top_prices(yes_book, buy_price=yes_buy, sell_price=yes_sell)
+            no_book = _book_with_live_top_prices(no_book, buy_price=no_buy, sell_price=no_sell)
         return yes_book, no_book
 
 
@@ -231,7 +388,7 @@ class CoinbaseSpotClient:
         await self._client.aclose()
 
     async def fetch_spot(self, asset_symbol: str) -> CoinbaseSpotPrice:
-        """Fetch the latest public Coinbase ticker price for BTC or ETH."""
+        """Fetch the latest public Coinbase ticker price for a supported crypto asset."""
         normalized = asset_symbol.upper()
         product_id = COINBASE_PRODUCTS.get(normalized)
         if product_id is None:
@@ -265,43 +422,157 @@ def _market_from_payload(
     fee_rate_crypto: float,
 ) -> PolymarketMarket | None:
     question = str(item.get("question") or "")
+    slug = str(item.get("slug") or item.get("_event_slug") or "")
     searchable = " ".join(
         str(item.get(key) or "")
-        for key in ("question", "slug", "category", "description", "groupItemTitle")
+        for key in (
+            "question",
+            "slug",
+            "category",
+            "description",
+            "groupItemTitle",
+            "_event_slug",
+            "_event_title",
+        )
     ).lower()
-    if keywords and not any(keyword in searchable for keyword in keywords):
+    asset_symbol = _asset_symbol_from_text(searchable)
+    if asset_symbol is None:
+        return None
+    normalized_keywords = [keyword.lower() for keyword in keywords]
+    if normalized_keywords and not any(keyword in searchable for keyword in normalized_keywords):
+        return None
+    if not _looks_like_up_down_market(searchable):
         return None
     if item.get("enableOrderBook") is False:
         return None
     if item.get("closed") or item.get("archived") or item.get("active") is False:
         return None
 
-    outcomes = _json_list(item.get("outcomes"))
-    token_ids = _json_list(item.get("clobTokenIds") or item.get("tokenIds"))
-    if len(outcomes) < 2 or len(token_ids) < 2:
+    resolution_time = _maybe_timestamp(
+        item.get("endDate") or item.get("endDateIso") or item.get("umaEndDate")
+    )
+    if resolution_time is None:
         return None
-    outcome_lookup = {str(outcome).lower(): index for index, outcome in enumerate(outcomes)}
-    yes_index = outcome_lookup.get("yes", 0)
-    no_index = outcome_lookup.get("no", 1)
-    asset_symbol = "ETH" if "eth" in searchable or "ethereum" in searchable else "BTC"
+    window_open_time = _window_open_from_payload(item, searchable, resolution_time)
+    if window_open_time is None:
+        return None
+    horizon_meta = _derive_short_horizon(window_open_time, resolution_time)
+    if horizon_meta is None:
+        return None
+    horizon, window_seconds = horizon_meta
+
+    token_ids = _json_list(item.get("clobTokenIds") or item.get("tokenIds"))
+    if len(token_ids) < 2:
+        return None
     fees_enabled = bool(item.get("feesEnabled", True))
+    market_id = item.get("id") or item.get("conditionId")
+    condition_id = item.get("conditionId") or item.get("id")
+    if market_id is None or condition_id is None:
+        return None
     return PolymarketMarket(
-        market_id=str(item.get("id") or item.get("conditionId")),
-        condition_id=str(item.get("conditionId") or item.get("id")),
+        market_id=str(market_id),
+        condition_id=str(condition_id),
+        slug=slug or None,
         question=question,
-        yes_token_id=str(token_ids[yes_index]),
-        no_token_id=str(token_ids[no_index]),
+        yes_token_id=str(token_ids[0]),
+        no_token_id=str(token_ids[1]),
         asset_symbol=asset_symbol,
-        resolution_time=_maybe_timestamp(
-            item.get("endDate") or item.get("endDateIso") or item.get("umaEndDate")
-        ),
+        horizon=horizon,
+        window_seconds=window_seconds,
+        window_open_time=window_open_time,
+        resolution_time=resolution_time,
         reference_price=_extract_reference_price(question),
         fees_enabled=fees_enabled,
         taker_fee_rate=_fee_rate_from_payload(item, fee_rate_crypto) if fees_enabled else 0.0,
     )
 
 
-def _levels(payload: Any) -> list[PolymarketBookLevel]:
+def _asset_symbol_from_text(searchable: str) -> str | None:
+    for symbol, aliases in SUPPORTED_ASSET_ALIASES.items():
+        if any(re.search(rf"\b{re.escape(alias)}\b", searchable) for alias in aliases):
+            return symbol
+    return None
+
+
+def _looks_like_up_down_market(searchable: str) -> bool:
+    return "up or down" in searchable or "updown" in searchable
+
+
+def _window_open_from_payload(
+    item: dict[str, Any],
+    searchable: str,
+    resolution_time: datetime,
+) -> datetime | None:
+    for key in ("startDate", "startDateIso", "startTime", "openTime", "windowStart"):
+        parsed = _maybe_timestamp(item.get(key))
+        if parsed is not None:
+            return parsed
+    return _window_open_from_text(searchable, resolution_time)
+
+
+def _window_open_from_text(text: str, resolution_time: datetime) -> datetime | None:
+    match = WINDOW_RE.search(text)
+    if match is None:
+        return None
+    local_resolution = resolution_time.astimezone(EASTERN_TZ)
+    month = match.group("month")
+    day = match.group("day")
+    if month is not None and day is not None:
+        month_number = MONTH_NUMBERS.get(month.lower())
+        if month_number is None:
+            return None
+        local_date = local_resolution.replace(
+            month=month_number,
+            day=int(day),
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    else:
+        local_date = local_resolution.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_meridiem = _meridiem(match.group("end"))
+    start_meridiem = _meridiem(match.group("start")) or end_meridiem
+    local_open = _parse_local_time(local_date, match.group("start"), start_meridiem)
+    return local_open.astimezone(UTC) if local_open is not None else None
+
+
+def _parse_local_time(
+    local_date: datetime,
+    raw_time: str,
+    fallback_meridiem: str | None,
+) -> datetime | None:
+    normalized = raw_time.lower().replace(" ", "")
+    if _meridiem(normalized) is None and fallback_meridiem is not None:
+        normalized = f"{normalized}{fallback_meridiem}"
+    try:
+        parsed_time = datetime.strptime(normalized, "%I:%M%p").time()
+    except ValueError:
+        return None
+    return local_date.replace(hour=parsed_time.hour, minute=parsed_time.minute)
+
+
+def _meridiem(raw_time: str) -> str | None:
+    normalized = raw_time.lower().replace(" ", "")
+    if normalized.endswith("am"):
+        return "am"
+    if normalized.endswith("pm"):
+        return "pm"
+    return None
+
+
+def _derive_short_horizon(
+    window_open_time: datetime,
+    resolution_time: datetime,
+) -> tuple[str, int] | None:
+    window_seconds = int(round((resolution_time - window_open_time).total_seconds()))
+    for horizon, canonical_seconds in SHORT_HORIZON_SECONDS.items():
+        if abs(window_seconds - canonical_seconds) <= 30:
+            return horizon, canonical_seconds
+    return None
+
+
+def _levels(payload: Any, *, descending: bool) -> list[PolymarketBookLevel]:
     levels: list[PolymarketBookLevel] = []
     for item in payload or []:
         try:
@@ -311,7 +582,92 @@ def _levels(payload: Any) -> list[PolymarketBookLevel]:
             continue
         if 0 <= price <= 1 and size > 0:
             levels.append(PolymarketBookLevel(price=price, size=size))
-    return levels
+    return sorted(levels, key=lambda level: level.price, reverse=descending)
+
+
+def _price_from_payload(payload: Any) -> float | None:
+    if isinstance(payload, int | float):
+        price = float(payload)
+        return price if 0 <= price <= 1 else None
+    if isinstance(payload, str):
+        price = float(payload)
+        return price if 0 <= price <= 1 else None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("price", "bestPrice", "value"):
+        raw_value = payload.get(key)
+        if raw_value is None:
+            continue
+        price = float(raw_value)
+        return price if 0 <= price <= 1 else None
+    return None
+
+
+def _price_to_beat_from_payload(payload: Any) -> float | None:
+    if isinstance(payload, int | float):
+        return float(payload)
+    if isinstance(payload, str):
+        return float(payload.replace(",", ""))
+    if not isinstance(payload, dict):
+        return None
+    for key in ("priceToBeat", "price_to_beat", "price", "value", "strike"):
+        raw_value = payload.get(key)
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, str):
+            return float(raw_value.replace(",", ""))
+        return float(raw_value)
+    return None
+
+
+def _book_pair_needs_price_fallback(
+    yes_book: PolymarketOrderBook,
+    no_book: PolymarketOrderBook,
+) -> bool:
+    yes_mid = _book_mid(yes_book)
+    no_mid = _book_mid(no_book)
+    if yes_mid is not None and no_mid is not None:
+        mid_sum = yes_mid + no_mid
+        if mid_sum < 0.97 or mid_sum > 1.03:
+            return True
+    if yes_book.best_ask is not None and no_book.best_ask is not None:
+        if yes_book.best_ask >= 0.95 and no_book.best_ask >= 0.95:
+            return True
+    return False
+
+
+def _book_mid(book: PolymarketOrderBook) -> float | None:
+    if book.best_bid is None or book.best_ask is None:
+        return None
+    return (book.best_bid + book.best_ask) / 2
+
+
+def _book_with_live_top_prices(
+    book: PolymarketOrderBook,
+    *,
+    buy_price: float | None,
+    sell_price: float | None,
+) -> PolymarketOrderBook:
+    return PolymarketOrderBook(
+        token_id=book.token_id,
+        market_id=book.market_id,
+        side=book.side,
+        timestamp=datetime.now(tz=UTC),
+        bids=_replace_top_price(book.bids, sell_price, descending=True),
+        asks=_replace_top_price(book.asks, buy_price, descending=False),
+    )
+
+
+def _replace_top_price(
+    levels: list[PolymarketBookLevel],
+    price: float | None,
+    *,
+    descending: bool,
+) -> list[PolymarketBookLevel]:
+    if price is None or not levels:
+        return levels
+    updated = [PolymarketBookLevel(price=price, size=levels[0].size), *levels[1:]]
+    return sorted(updated, key=lambda level: level.price, reverse=descending)
 
 
 def _json_list(value: Any) -> list[Any]:

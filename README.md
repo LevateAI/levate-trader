@@ -96,11 +96,16 @@ behavior.
 
 ### Polymarket Paper Bot
 
-`POLYMARKET_ACCOUNT_ID`: separate prediction-market account namespace. Defaults
-to `polymarket_crypto`.
+`POLYMARKET_ACCOUNT_ID`: fallback prediction-market account namespace. In the
+horizon services, the runtime derives one book per asset as
+`btc_5m`, `eth_5m`, `sol_5m`, `xrp_5m`, `btc_15m`, `eth_15m`, `sol_15m`, and
+`xrp_15m`.
 
-`POLYMARKET_STARTING_BALANCE_USD`: standalone Polymarket paper balance. Defaults
-to `500`.
+`POLYMARKET_ASSETS`: comma-separated assets for a horizon process. Defaults to
+`BTC,ETH,SOL,XRP`.
+
+`POLYMARKET_STARTING_BALANCE_USD`: starting paper balance for each
+asset-by-horizon book. Defaults to `500`.
 
 `POLYMARKET_POLL_INTERVAL_SEC`: two-feed polling cadence for Polymarket CLOB and
 Coinbase spot. Defaults to `2`.
@@ -109,7 +114,8 @@ Coinbase spot. Defaults to `2`.
 Coinbase watchdog reconnects. Defaults to `20`.
 
 `POLYMARKET_MARKET_KEYWORDS`: comma-separated market-discovery filters for
-short-duration crypto markets. Defaults to `bitcoin,btc,ethereum,eth`.
+short-duration crypto markets. Defaults to
+`bitcoin,btc,ethereum,eth,solana,sol,xrp,ripple`.
 
 `POLYMARKET_FEE_RATE_CRYPTO`: Polymarket crypto taker fee coefficient used by
 the paper executor. Defaults to `0.07`.
@@ -200,10 +206,29 @@ The Polymarket paper bot is bot #7, but it uses a separate leaderboard and
 separate `polymarket_*` Supabase tables because prediction shares resolve to
 `$0` or `$1`, not perp PnL.
 
-The module reads public Polymarket CLOB books and Coinbase BTC/ETH spot prices,
-joins them into synchronized snapshots, writes `polymarket_market_snapshots`,
-and tracks a standalone `$500` paper account. It has no wallets, signing, or
-real-money order paths.
+The module reads public Polymarket CLOB books and Coinbase BTC/ETH/SOL/XRP spot
+prices, joins them into synchronized snapshots, writes
+`polymarket_market_snapshots`, and tracks standalone paper accounts. It has no
+wallets, signing, or real-money order paths.
+
+Discovery is restricted to short-duration crypto `Up or Down` markets with
+5-minute and 15-minute ET windows. Long-dated milestone markets are rejected
+before they ever reach the strategy layer. Each snapshot also stores the
+per-window `price_to_beat` strike from Polymarket's public equity endpoint when
+available, plus `horizon`, `window_seconds`, and seconds remaining to
+resolution.
+
+The repo includes two horizon env templates:
+
+- `envs/polymarket_5m.env`: `POLYMARKET_HORIZON=5m`,
+  `POLYMARKET_ASSETS=BTC,ETH,SOL,XRP`
+- `envs/polymarket_15m.env`: `POLYMARKET_HORIZON=15m`,
+  `POLYMARKET_ASSETS=BTC,ETH,SOL,XRP`
+
+Together they drive eight isolated paper books, one account per coin and
+horizon: `btc_5m`, `eth_5m`, `sol_5m`, `xrp_5m`, `btc_15m`, `eth_15m`,
+`sol_15m`, and `xrp_15m`. Each book starts with `$500`; P&L never commingles
+between coins or horizons.
 
 The first two paper strategies are:
 
@@ -214,10 +239,12 @@ The first two paper strategies are:
   realized volatility, then buys an underpriced side only when the model edge
   clears the configured threshold. This is probabilistic, not guaranteed.
 
-Runtime liveness is work-gated. `STALE_LIMIT_SECONDS` controls how long a
-Polymarket component can go without a proven successful iteration before the
-process exits for systemd restart. `WATCHDOG_INTERVAL_SECONDS` controls how
-often those component heartbeats are upserted to `bot_heartbeat`.
+Runtime liveness is work-gated. Heartbeat component names include horizon and
+coin, such as `5m_btc_snapshot` and `15m_xrp_strategy`, so a single stalled
+book is visible. `STALE_LIMIT_SECONDS` controls how long a component can go
+without a proven successful iteration before the process exits for systemd
+restart. `WATCHDOG_INTERVAL_SECONDS` controls how often those component
+heartbeats are upserted to `bot_heartbeat`.
 
 Run locally:
 
@@ -225,11 +252,12 @@ Run locally:
 python -m src.polymarket.main
 ```
 
-Install the separate systemd unit, then start it:
+Install the separate systemd units, then start each horizon:
 
 ```bash
-sudo systemctl start levate-polymarket
-sudo journalctl -u levate-polymarket -f
+sudo systemctl start levate-polymarket-5m
+sudo systemctl start levate-polymarket-15m
+sudo journalctl -u levate-polymarket-5m -f
 ```
 
 ## Funding Hyperliquid Testnet

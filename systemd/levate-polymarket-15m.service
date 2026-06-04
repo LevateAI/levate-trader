@@ -1,0 +1,19 @@
+[Unit]
+Description=Levate Polymarket paper bot (15m)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=levateai
+WorkingDirectory=/home/levateai/levate-trader
+EnvironmentFile=/home/levateai/levate-trader/envs/polymarket_15m.env
+Environment=POLYMARKET_HORIZON=15m
+ExecStart=/home/levateai/levate-trader/.venv/bin/python -m src.polymarket.main
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
