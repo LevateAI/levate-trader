@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import time
@@ -174,6 +175,7 @@ class PolymarketClobClient:
         self._timeout_sec = timeout_sec
         self._client = httpx.AsyncClient(timeout=timeout_sec)
         self.watchdog = FeedWatchdog("polymarket_clob", stale_threshold_sec=stale_threshold_sec)
+        self._price_to_beat_cache: dict[str, float] = {}
 
     async def reconnect(self) -> None:
         """Recreate the HTTP client used by the polling feed."""
@@ -435,6 +437,16 @@ class PolymarketClobClient:
         """Fetch the official per-window price-to-beat, falling back to parsed strike."""
         if not market.slug:
             return market.reference_price
+        cached_price_to_beat = self._price_to_beat_cache.get(market.slug)
+        if cached_price_to_beat is not None:
+            logger.info(
+                "polymarket_price_to_beat_cache_hit",
+                market_id=market.market_id,
+                slug=market.slug,
+                price_to_beat=cached_price_to_beat,
+            )
+            return cached_price_to_beat
+        price_to_beat: float | None = None
         try:
             response = await self._client.get(
                 f"{self._polymarket_web_url}/api/equity/price-to-beat/{market.slug}"
@@ -450,16 +462,65 @@ class PolymarketClobClient:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
-            return market.reference_price
+        else:
+            if price_to_beat is not None:
+                self.watchdog.mark_message_received()
+                self._price_to_beat_cache[market.slug] = price_to_beat
+                logger.info(
+                    "polymarket_price_to_beat_fetched",
+                    market_id=market.market_id,
+                    slug=market.slug,
+                    price_to_beat=price_to_beat,
+                    source="price_to_beat_api",
+                )
+                return price_to_beat
+
+        page_price_to_beat = await self._fetch_price_to_beat_from_event_page(market)
+        if page_price_to_beat is not None:
+            self._price_to_beat_cache[market.slug] = page_price_to_beat
+            logger.info(
+                "polymarket_price_to_beat_fetched",
+                market_id=market.market_id,
+                slug=market.slug,
+                price_to_beat=page_price_to_beat,
+                source="event_page_crypto_prices",
+            )
+            return page_price_to_beat
         if price_to_beat is None:
             return market.reference_price
+        return price_to_beat
+
+    async def _fetch_price_to_beat_from_event_page(
+        self,
+        market: PolymarketMarket,
+    ) -> float | None:
+        if not market.slug:
+            return None
+        try:
+            response = await self._client.get(f"{self._polymarket_web_url}/event/{market.slug}")
+            response.raise_for_status()
+            price_to_beat = _price_to_beat_from_event_page_html(response.text, market)
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            logger.warning(
+                "polymarket_price_to_beat_page_fetch_failed",
+                market_id=market.market_id,
+                slug=market.slug,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            return None
+        if price_to_beat is None:
+            logger.warning(
+                "polymarket_price_to_beat_page_missing",
+                market_id=market.market_id,
+                slug=market.slug,
+                window_open_time=market.window_open_time.isoformat(),
+                resolution_time=market.resolution_time.isoformat()
+                if market.resolution_time is not None
+                else None,
+            )
+            return None
         self.watchdog.mark_message_received()
-        logger.info(
-            "polymarket_price_to_beat_fetched",
-            market_id=market.market_id,
-            slug=market.slug,
-            price_to_beat=price_to_beat,
-        )
         return price_to_beat
 
     async def fetch_books_for_market(
@@ -906,6 +967,88 @@ def _price_to_beat_from_payload(payload: Any) -> float | None:
             return float(raw_value.replace(",", ""))
         return float(raw_value)
     return None
+
+
+def _price_to_beat_from_event_page_html(
+    page_html: str,
+    market: PolymarketMarket,
+) -> float | None:
+    """Extract the window open price from Polymarket's hydrated event page data."""
+    match = re.search(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        page_html,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    next_data = json.loads(html.unescape(match.group(1)))
+    return _price_to_beat_from_next_data(next_data, market)
+
+
+def _price_to_beat_from_next_data(
+    next_data: Any,
+    market: PolymarketMarket,
+) -> float | None:
+    """Extract price-to-beat from Next query cache data for a specific market."""
+    exact_event_metadata = _event_metadata_price_to_beat(next_data, market.slug)
+    if exact_event_metadata is not None:
+        return exact_event_metadata
+
+    open_time = market.window_open_time
+    resolution_time = market.resolution_time
+    if resolution_time is None:
+        return None
+    for query in _iter_dicts(next_data):
+        query_key = query.get("queryKey")
+        state = query.get("state")
+        if not isinstance(query_key, list) or not isinstance(state, dict):
+            continue
+        if len(query_key) < 6 or query_key[0:2] != ["crypto-prices", "price"]:
+            continue
+        symbol = str(query_key[2]).upper()
+        query_open_time = _maybe_timestamp(query_key[3])
+        query_close_time = _maybe_timestamp(query_key[5])
+        if symbol != market.asset_symbol.upper():
+            continue
+        if query_open_time != open_time or query_close_time != resolution_time:
+            continue
+        data = state.get("data")
+        if not isinstance(data, dict):
+            continue
+        raw_open_price = data.get("openPrice")
+        if raw_open_price is None:
+            continue
+        return float(raw_open_price)
+    return None
+
+
+def _event_metadata_price_to_beat(next_data: Any, slug: str | None) -> float | None:
+    if not slug:
+        return None
+    for item in _iter_dicts(next_data):
+        item_slug = item.get("slug") or item.get("ticker")
+        if item_slug != slug:
+            continue
+        event_metadata = item.get("eventMetadata")
+        if not isinstance(event_metadata, dict):
+            continue
+        raw_price_to_beat = event_metadata.get("priceToBeat")
+        if raw_price_to_beat is not None:
+            return float(raw_price_to_beat)
+    return None
+
+
+def _iter_dicts(value: Any) -> list[dict[str, Any]]:
+    dicts: list[dict[str, Any]] = []
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            dicts.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return dicts
 
 
 def _book_pair_needs_price_fallback(

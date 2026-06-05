@@ -16,6 +16,7 @@ from src.polymarket.feeds import (
     _levels,
     _market_from_payload,
     _market_payload_diagnostics,
+    _price_to_beat_from_next_data,
 )
 from src.polymarket.main import PolymarketComponentStaleError, PolymarketRuntime
 from src.polymarket.models import (
@@ -190,6 +191,16 @@ class MultiHorizonClob(FakeClob):
         return [five_min, fifteen_min]
 
 
+class MissingStrikeClob(FakeClob):
+    async def fetch_crypto_markets(self, keywords: list[str], limit: int) -> list[PolymarketMarket]:
+        market = _market()
+        market.reference_price = None
+        return [market]
+
+    async def fetch_price_to_beat(self, market: PolymarketMarket) -> float | None:
+        return None
+
+
 class FallbackPriceClob(PolymarketClobClient):
     def __init__(self) -> None:
         self.watchdog = FeedWatchdog("fallback-test")
@@ -324,6 +335,39 @@ def test_candidate_updown_slugs_cover_assets_and_horizons() -> None:
     assert "xrp-updown-15m-1780615800" in slugs
 
 
+def test_price_to_beat_from_next_data_uses_crypto_prices_open_price() -> None:
+    market = _market()
+    market.slug = "btc-updown-5m-1780617000"
+    market.asset_symbol = "BTC"
+    market.window_open_time = datetime(2026, 6, 4, 23, 50, tzinfo=UTC)
+    market.resolution_time = datetime(2026, 6, 4, 23, 55, tzinfo=UTC)
+    next_data = {
+        "props": {
+            "pageProps": {
+                "dehydratedState": {
+                    "queries": [
+                        {
+                            "queryKey": [
+                                "crypto-prices",
+                                "price",
+                                "BTC",
+                                "2026-06-04T23:50:00Z",
+                                "fiveminute",
+                                "2026-06-04T23:55:00Z",
+                            ],
+                            "state": {"data": {"openPrice": 63700.93635151024}},
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    assert _price_to_beat_from_next_data(next_data, market) == pytest.approx(
+        63700.93635151024
+    )
+
+
 def test_polymarket_account_ids_are_coin_by_horizon_books() -> None:
     runtime = object.__new__(PolymarketRuntime)
     runtime.settings = SimpleNamespace(polymarket_horizon="15m")
@@ -436,6 +480,20 @@ async def test_two_feed_synchronizer_produces_joined_snapshot() -> None:
     assert payload["window_seconds"] == 300
     assert payload["seconds_to_resolution"] > 0
     assert payload["price_to_beat"] == pytest.approx(100_000)
+
+
+@pytest.mark.asyncio
+async def test_synchronizer_skips_snapshot_when_price_to_beat_missing() -> None:
+    synchronizer = PolymarketDataSynchronizer(
+        clob_client=MissingStrikeClob(),  # type: ignore[arg-type]
+        coinbase_client=FakeCoinbase(),  # type: ignore[arg-type]
+        keywords=["bitcoin"],
+        max_markets=1,
+    )
+
+    snapshots = await synchronizer.build_snapshots()
+
+    assert snapshots == []
 
 
 @pytest.mark.asyncio

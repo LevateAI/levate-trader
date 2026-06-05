@@ -91,6 +91,21 @@ class PolymarketDataSynchronizer:
         price_to_beat = (
             live_price_to_beat if live_price_to_beat is not None else market.reference_price
         )
+        if price_to_beat is None:
+            logger.warning(
+                "polymarket_snapshot_skipped_missing_price_to_beat",
+                market_id=market.market_id,
+                slug=market.slug,
+                asset_symbol=market.asset_symbol,
+                horizon=market.horizon,
+                window_open_time=market.window_open_time.isoformat(),
+                resolution_time=(
+                    market.resolution_time.isoformat()
+                    if market.resolution_time is not None
+                    else None
+                ),
+            )
+            return None
         market.reference_price = price_to_beat
         timestamp = max(yes_book.timestamp, no_book.timestamp, spot.timestamp)
         snapshot = PolymarketMarketSnapshot(
