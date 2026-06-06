@@ -470,12 +470,14 @@ class PolymarketRuntime:
                 strategy = strategy_cls(
                     threshold=self.settings.polymarket_sum_arb_threshold,
                     max_account_pct=self.settings.polymarket_sum_arb_max_account_pct,
+                    max_stake_usd=self.settings.polymarket_sum_arb_max_stake_usd,
                     cooldown_seconds=self.settings.polymarket_strategy_cooldown_sec,
                 )
             elif strategy_cls is LatencyArbStrategy:
                 strategy = strategy_cls(
                     edge_threshold=self.settings.polymarket_latency_edge_threshold,
                     max_account_pct=self.settings.polymarket_latency_max_account_pct,
+                    max_stake_usd=self.settings.polymarket_latency_max_stake_usd,
                     cooldown_seconds=self.settings.polymarket_strategy_cooldown_sec,
                 )
             else:

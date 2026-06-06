@@ -57,10 +57,12 @@ class MultiOutcomeSumArbitrageStrategy:
         self,
         threshold: float = 0.02,
         max_account_pct: float = 0.10,
+        max_stake_usd: float = 50.0,
         cooldown_seconds: int = 300,
     ) -> None:
         self._threshold = threshold
         self._max_account_pct = max_account_pct
+        self._max_stake_usd = max_stake_usd
         self._cooldown = timedelta(seconds=cooldown_seconds)
         self._last_signal_at: dict[str, datetime] = {}
 
@@ -89,7 +91,11 @@ class MultiOutcomeSumArbitrageStrategy:
         if best_edge <= self._threshold:
             return None
 
-        max_notional = max(account_equity * self._max_account_pct, 0.0)
+        max_notional = _capped_notional(
+            account_equity=account_equity,
+            max_account_pct=self._max_account_pct,
+            max_stake_usd=self._max_stake_usd,
+        )
         target_shares = _shares_for_pair_notional(
             context.yes_book.asks,
             context.no_book.asks,
@@ -148,6 +154,7 @@ class MultiOutcomeSumArbitrageStrategy:
             window_seconds=context.market.window_seconds,
             reason_entry=reason,
             risk_profile="guaranteed_if_both_legs_fill",
+            max_stake_usd=max_notional,
             legs=[
                 PolymarketSignalLeg(
                     side=PolymarketSide.YES,
@@ -185,10 +192,12 @@ class LatencyArbStrategy:
         self,
         edge_threshold: float = 0.05,
         max_account_pct: float = 0.05,
+        max_stake_usd: float = 25.0,
         cooldown_seconds: int = 300,
     ) -> None:
         self._edge_threshold = edge_threshold
         self._max_account_pct = max_account_pct
+        self._max_stake_usd = max_stake_usd
         self._cooldown = timedelta(seconds=cooldown_seconds)
         self._last_signal_at: dict[str, datetime] = {}
 
@@ -231,7 +240,11 @@ class LatencyArbStrategy:
         if edge <= self._edge_threshold:
             return None
 
-        max_notional = account_equity * self._max_account_pct
+        max_notional = _capped_notional(
+            account_equity=account_equity,
+            max_account_pct=self._max_account_pct,
+            max_stake_usd=self._max_stake_usd,
+        )
         shares = _shares_for_notional(book.asks, max_notional, context.market.taker_fee_rate)
         if shares <= 0:
             return None
@@ -259,6 +272,7 @@ class LatencyArbStrategy:
             window_seconds=context.market.window_seconds,
             reason_entry=reason,
             risk_profile="probabilistic_latency_edge",
+            max_stake_usd=max_notional,
             legs=[
                 PolymarketSignalLeg(
                     side=side,
@@ -360,6 +374,14 @@ def _shares_for_notional(
 
 def _fee_per_share(price: float, fee_rate: float) -> float:
     return fee_for_trade(1.0, price, fee_rate)
+
+
+def _capped_notional(
+    account_equity: float,
+    max_account_pct: float,
+    max_stake_usd: float,
+) -> float:
+    return max(min(account_equity * max_account_pct, max_stake_usd), 0.0)
 
 
 def _is_latency_price_tradable(price: float | None) -> bool:

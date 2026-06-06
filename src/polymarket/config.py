@@ -30,8 +30,10 @@ class PolymarketSettings(BaseSettings):
     polymarket_strategies_enabled: str = "multi_outcome_sum_arb,latency_arb"
     polymarket_sum_arb_threshold: float = 0.02
     polymarket_sum_arb_max_account_pct: float = 0.10
+    polymarket_sum_arb_max_stake_usd: float = 50.0
     polymarket_latency_edge_threshold: float = 0.05
     polymarket_latency_max_account_pct: float = 0.05
+    polymarket_latency_max_stake_usd: float = 25.0
     polymarket_vol_window_sec: int = 900
     polymarket_strategy_cooldown_sec: int = 300
     stale_limit_seconds: int = 120
@@ -84,6 +86,8 @@ class PolymarketSettings(BaseSettings):
         "polymarket_sum_arb_max_account_pct",
         "polymarket_latency_edge_threshold",
         "polymarket_latency_max_account_pct",
+        "polymarket_sum_arb_max_stake_usd",
+        "polymarket_latency_max_stake_usd",
     )
     @classmethod
     def validate_strategy_fractions(cls, value: float) -> float:

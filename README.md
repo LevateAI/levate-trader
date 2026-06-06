@@ -129,11 +129,17 @@ fees for sum arbitrage. Defaults to `0.02`.
 `POLYMARKET_SUM_ARB_MAX_ACCOUNT_PCT`: max account equity allocated to one
 sum-arb pair. Defaults to `0.10`.
 
+`POLYMARKET_SUM_ARB_MAX_STAKE_USD`: hard dollar cap allocated to one sum-arb
+pair, regardless of inflated paper equity. Defaults to `50`.
+
 `POLYMARKET_LATENCY_EDGE_THRESHOLD`: minimum model edge for probabilistic
 Coinbase-vs-Polymarket latency arb. Defaults to `0.05`.
 
 `POLYMARKET_LATENCY_MAX_ACCOUNT_PCT`: max account equity allocated to one
 latency-arb leg. Defaults to `0.05`.
+
+`POLYMARKET_LATENCY_MAX_STAKE_USD`: hard dollar cap allocated to one latency-arb
+leg, regardless of inflated paper equity. Defaults to `25`.
 
 `POLYMARKET_VOL_WINDOW_SEC`: rolling Coinbase spot window used for realized
 volatility. Defaults to `900`.

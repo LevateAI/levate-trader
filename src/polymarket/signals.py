@@ -30,3 +30,4 @@ class PolymarketSignal:
     risk_profile: str
     legs: list[PolymarketSignalLeg]
     features: dict[str, Any] = field(default_factory=dict)
+    max_stake_usd: float | None = None

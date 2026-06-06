@@ -31,11 +31,13 @@ class PolymarketPaperExecutor:
         starting_balance_usd: float = 500.0,
         taker_fee_rate: float = 0.07,
         fees_enabled: bool = True,
+        default_max_stake_usd: float = 50.0,
     ) -> None:
         self.account_id = account_id
         self.balance_usd = _money(starting_balance_usd)
         self.taker_fee_rate = taker_fee_rate
         self.fees_enabled = fees_enabled
+        self.default_max_stake_usd = default_max_stake_usd
         self.positions: dict[tuple[str, PolymarketSide], PolymarketPosition] = {}
         self.trades: dict[str, PolymarketTrade] = {}
         self._open_trade_ids_by_position: dict[tuple[str, PolymarketSide], list[str]] = {}
@@ -54,7 +56,23 @@ class PolymarketPaperExecutor:
     async def execute_signal(self, signal: PolymarketSignal) -> list[PolymarketTrade]:
         """Execute a strategy signal using the existing paper fill model."""
         trades: list[PolymarketTrade] = []
+        remaining_stake_usd = min(
+            signal.max_stake_usd
+            if signal.max_stake_usd is not None
+            else self.default_max_stake_usd,
+            self.balance_usd,
+        )
         for leg in signal.legs:
+            if remaining_stake_usd <= 0:
+                logger.warning(
+                    "polymarket_paper_signal_stake_exhausted",
+                    account_id=self.account_id,
+                    market_id=signal.market_id,
+                    strategy_name=signal.strategy_name,
+                    max_stake_usd=signal.max_stake_usd,
+                )
+                break
+            balance_before = self.balance_usd
             trade = await self.open_position(
                 market_id=signal.market_id,
                 side=leg.side,
@@ -64,6 +82,10 @@ class PolymarketPaperExecutor:
                 reason_entry=signal.reason_entry,
                 horizon=signal.horizon,
                 window_seconds=signal.window_seconds,
+                max_stake_usd=remaining_stake_usd,
+            )
+            remaining_stake_usd = _money(
+                remaining_stake_usd - max(balance_before - self.balance_usd, 0.0)
             )
             trades.append(trade)
         return trades
@@ -78,6 +100,7 @@ class PolymarketPaperExecutor:
         reason_entry: str,
         horizon: str = "5m",
         window_seconds: int = 300,
+        max_stake_usd: float | None = None,
     ) -> PolymarketTrade:
         """Buy shares from the ask book, filling only available depth."""
         if requested_shares <= 0:
@@ -85,6 +108,12 @@ class PolymarketPaperExecutor:
         if order_book.side != side:
             raise ValueError("order book side does not match requested side")
 
+        available_usdc = min(
+            self.balance_usd,
+            max_stake_usd if max_stake_usd is not None else self.default_max_stake_usd,
+        )
+        if available_usdc <= 0:
+            raise ValueError("paper stake cap or balance cannot afford shares")
         filled_shares, gross_cost = _walk_book(order_book.asks, requested_shares)
         if filled_shares <= 0:
             raise ValueError("no ask liquidity available for paper fill")
@@ -92,11 +121,11 @@ class PolymarketPaperExecutor:
         _validate_entry_price(avg_entry_price)
         fee = self._fee(filled_shares, avg_entry_price)
         total_cost = gross_cost + fee
-        if total_cost > self.balance_usd:
+        if total_cost > available_usdc:
             affordable_shares = _affordable_shares(
                 order_book.asks,
-                self.balance_usd,
-                self.taker_fee_rate,
+                available_usdc,
+                self.taker_fee_rate if self.fees_enabled else 0.0,
             )
             filled_shares, gross_cost = _walk_book(order_book.asks, affordable_shares)
             if filled_shares <= 0:

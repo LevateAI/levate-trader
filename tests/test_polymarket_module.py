@@ -30,6 +30,7 @@ from src.polymarket.models import (
     fee_for_trade,
 )
 from src.polymarket.paper_executor import PolymarketPaperExecutor
+from src.polymarket.signals import PolymarketSignal, PolymarketSignalLeg
 from src.polymarket.strategies import LatencyArbStrategy, MultiOutcomeSumArbitrageStrategy
 from src.polymarket.synchronizer import PolymarketDataSynchronizer
 from src.polymarket.volatility import CoinbaseVolatilityTracker
@@ -609,6 +610,83 @@ async def test_paper_executor_rejects_zero_price_fill() -> None:
 
 
 @pytest.mark.asyncio
+async def test_paper_executor_caps_signal_to_max_stake() -> None:
+    executor = PolymarketPaperExecutor("poly-test", starting_balance_usd=500, fees_enabled=False)
+    book = _book(PolymarketSide.YES, asks=[(0.19, 2_000_000)])
+    signal = PolymarketSignal(
+        strategy_name="latency_arb",
+        market_id="market-1",
+        horizon="5m",
+        window_seconds=300,
+        reason_entry="malformed oversized signal",
+        risk_profile="test",
+        max_stake_usd=25,
+        legs=[
+            PolymarketSignalLeg(
+                side=PolymarketSide.YES,
+                shares=1_577_843,
+                order_book=book,
+                expected_avg_price=0.19,
+            )
+        ],
+    )
+
+    trades = await executor.execute_signal(signal)
+
+    assert len(trades) == 1
+    assert trades[0].shares == pytest.approx(25 / 0.19)
+    assert trades[0].shares * trades[0].entry_price <= 25.01
+    assert executor.balance_usd == pytest.approx(475.0)
+
+
+@pytest.mark.asyncio
+async def test_paper_executor_direct_open_uses_default_stake_cap() -> None:
+    executor = PolymarketPaperExecutor("poly-test", starting_balance_usd=500, fees_enabled=False)
+
+    trade = await executor.open_position(
+        "market-1",
+        PolymarketSide.YES,
+        1_000_000,
+        _book(PolymarketSide.YES, asks=[(0.25, 1_000_000)]),
+        "test",
+        "direct open cap test",
+    )
+
+    assert trade.shares == pytest.approx(200)
+    assert trade.shares * trade.entry_price <= 50
+    assert executor.balance_usd == pytest.approx(450)
+
+
+@pytest.mark.asyncio
+async def test_paper_executor_never_stakes_more_than_balance() -> None:
+    executor = PolymarketPaperExecutor("poly-test", starting_balance_usd=20, fees_enabled=False)
+    book = _book(PolymarketSide.YES, asks=[(0.5, 1_000)])
+    signal = PolymarketSignal(
+        strategy_name="latency_arb",
+        market_id="market-1",
+        horizon="5m",
+        window_seconds=300,
+        reason_entry="oversized relative to balance",
+        risk_profile="test",
+        max_stake_usd=50,
+        legs=[
+            PolymarketSignalLeg(
+                side=PolymarketSide.YES,
+                shares=1_000,
+                order_book=book,
+                expected_avg_price=0.5,
+            )
+        ],
+    )
+
+    trades = await executor.execute_signal(signal)
+
+    assert trades[0].shares == pytest.approx(40)
+    assert trades[0].shares * trades[0].entry_price <= 20
+    assert executor.balance_usd == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
 async def test_mark_to_market_updates_unrealized_pnl_from_bid_book() -> None:
     executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
     await executor.open_position(
@@ -670,7 +748,34 @@ async def test_sum_arb_detects_and_sizes_within_book_depth() -> None:
     assert len(signal.legs) == 2
     assert signal.legs[0].shares == pytest.approx(signal.legs[1].shares)
     assert signal.legs[0].shares <= 30
+    assert signal.max_stake_usd == pytest.approx(50)
     assert signal.features["edge_after_fees"] > 0.02
+
+
+@pytest.mark.asyncio
+async def test_sum_arb_fixed_stake_cap_survives_polluted_equity() -> None:
+    strategy = MultiOutcomeSumArbitrageStrategy(
+        threshold=0.02,
+        max_account_pct=0.10,
+        max_stake_usd=50,
+    )
+    context = _context(
+        yes_book=_book(PolymarketSide.YES, asks=[(0.45, 1_000_000)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.45, 1_000_000)]),
+    )
+
+    signal = await strategy.on_context(
+        context,
+        account_equity=23_100_000,
+        volatility_tracker=CoinbaseVolatilityTracker(),
+    )
+
+    assert signal is not None
+    assert signal.max_stake_usd == pytest.approx(50)
+    total_entry_notional = sum(
+        leg.shares * leg.expected_avg_price for leg in signal.legs
+    )
+    assert total_entry_notional <= 50
 
 
 @pytest.mark.asyncio
@@ -737,8 +842,34 @@ async def test_latency_arb_emits_signal_only_when_edge_exceeds_threshold() -> No
     assert signal is not None
     assert signal.strategy_name == "latency_arb"
     assert signal.legs[0].side == PolymarketSide.YES
+    assert signal.max_stake_usd == pytest.approx(25)
     assert signal.features["fair_yes_probability"] > signal.legs[0].expected_avg_price
     assert no_signal is None
+
+
+@pytest.mark.asyncio
+async def test_latency_arb_fixed_stake_cap_survives_polluted_equity() -> None:
+    strategy = LatencyArbStrategy(edge_threshold=0.05, max_account_pct=0.05, max_stake_usd=25)
+    now = datetime.now(tz=UTC)
+    tracker = CoinbaseVolatilityTracker(window_sec=3600)
+    tracker.record_price("BTC", 104_900, now - timedelta(seconds=120))
+    tracker.record_price("BTC", 104_950, now - timedelta(seconds=60))
+    tracker.record_price("BTC", 105_000, now)
+    market = _market()
+    market.resolution_time = now + timedelta(hours=1)
+    context = _context(
+        market=market,
+        spot=105_000,
+        yes_book=_book(PolymarketSide.YES, asks=[(0.19, 2_000_000)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.81, 2_000_000)]),
+    )
+
+    signal = await strategy.on_context(context, 23_100_000, tracker, now=now)
+
+    assert signal is not None
+    assert signal.max_stake_usd == pytest.approx(25)
+    assert signal.legs[0].shares * signal.legs[0].expected_avg_price <= 25
+    assert signal.legs[0].shares < 200
 
 
 @pytest.mark.asyncio
