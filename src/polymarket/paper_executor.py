@@ -38,6 +38,7 @@ class PolymarketPaperExecutor:
         self.fees_enabled = fees_enabled
         self.positions: dict[tuple[str, PolymarketSide], PolymarketPosition] = {}
         self.trades: dict[str, PolymarketTrade] = {}
+        self._open_trade_ids_by_position: dict[tuple[str, PolymarketSide], list[str]] = {}
         self.closed_positions: list[PolymarketPosition] = []
 
     @property
@@ -88,6 +89,7 @@ class PolymarketPaperExecutor:
         if filled_shares <= 0:
             raise ValueError("no ask liquidity available for paper fill")
         avg_entry_price = gross_cost / filled_shares
+        _validate_entry_price(avg_entry_price)
         fee = self._fee(filled_shares, avg_entry_price)
         total_cost = gross_cost + fee
         if total_cost > self.balance_usd:
@@ -100,6 +102,7 @@ class PolymarketPaperExecutor:
             if filled_shares <= 0:
                 raise ValueError("paper balance cannot afford available shares")
             avg_entry_price = gross_cost / filled_shares
+            _validate_entry_price(avg_entry_price)
             fee = self._fee(filled_shares, avg_entry_price)
             total_cost = gross_cost + fee
 
@@ -144,6 +147,7 @@ class PolymarketPaperExecutor:
             reason_entry=reason_entry,
         )
         self.trades[str(trade.id)] = trade
+        self._open_trade_ids_by_position.setdefault(key, []).append(str(trade.id))
         logger.info(
             "polymarket_paper_position_opened",
             account_id=self.account_id,
@@ -210,24 +214,20 @@ class PolymarketPaperExecutor:
             self.positions.pop((market_id, side), None)
             self.closed_positions.append(position)
 
-        trade = PolymarketTrade(
-            id=uuid4(),
-            account_id=self.account_id,
-            timestamp=datetime.now(tz=UTC),
+        trade = self._settle_open_trade(
             market_id=market_id,
+            side=side,
             horizon=position.horizon,
             window_seconds=position.window_seconds,
-            strategy_name="paper_manual",
-            side=side,
             shares=filled_shares,
             entry_price=position.avg_entry_price,
             exit_price=avg_exit_price,
             pnl_usd=pnl,
             status=PolymarketTradeStatus.CLOSED,
-            reason_entry="paper close of existing position",
+            fallback_strategy_name="paper_manual",
+            fallback_reason_entry="paper close of existing position",
             reason_exit=reason_exit,
         )
-        self.trades[str(trade.id)] = trade
         logger.info(
             "polymarket_paper_position_closed",
             account_id=self.account_id,
@@ -258,24 +258,20 @@ class PolymarketPaperExecutor:
         self.positions.pop((market_id, side), None)
         self.closed_positions.append(position)
 
-        trade = PolymarketTrade(
-            id=uuid4(),
-            account_id=self.account_id,
-            timestamp=datetime.now(tz=UTC),
+        trade = self._settle_open_trade(
             market_id=market_id,
+            side=side,
             horizon=position.horizon,
             window_seconds=position.window_seconds,
-            strategy_name="paper_resolution",
-            side=side,
             shares=position.shares,
             entry_price=position.avg_entry_price,
             exit_price=payout_price,
             pnl_usd=pnl,
             status=PolymarketTradeStatus.RESOLVED,
-            reason_entry="paper settlement of existing position",
+            fallback_strategy_name="paper_resolution",
+            fallback_reason_entry="paper settlement of existing position",
             reason_exit=f"market resolved {resolution_outcome.value}",
         )
-        self.trades[str(trade.id)] = trade
         logger.info(
             "polymarket_paper_position_resolved",
             account_id=self.account_id,
@@ -291,6 +287,52 @@ class PolymarketPaperExecutor:
             return 0.0
         return fee_for_trade(shares, avg_price, self.taker_fee_rate)
 
+    def _settle_open_trade(
+        self,
+        *,
+        market_id: str,
+        side: PolymarketSide,
+        horizon: str,
+        window_seconds: int,
+        shares: float,
+        entry_price: float,
+        exit_price: float,
+        pnl_usd: float,
+        status: PolymarketTradeStatus,
+        fallback_strategy_name: str,
+        fallback_reason_entry: str,
+        reason_exit: str,
+    ) -> PolymarketTrade:
+        key = (market_id, side)
+        trade_ids = self._open_trade_ids_by_position.pop(key, [])
+        if trade_ids:
+            trade = self.trades.get(trade_ids[0])
+            if trade is not None:
+                trade.exit_price = exit_price
+                trade.pnl_usd = pnl_usd
+                trade.status = status
+                trade.reason_exit = reason_exit
+                return trade
+        trade = PolymarketTrade(
+            id=uuid4(),
+            account_id=self.account_id,
+            timestamp=datetime.now(tz=UTC),
+            market_id=market_id,
+            horizon=horizon,
+            window_seconds=window_seconds,
+            strategy_name=fallback_strategy_name,
+            side=side,
+            shares=shares,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            pnl_usd=pnl_usd,
+            status=status,
+            reason_entry=fallback_reason_entry,
+            reason_exit=reason_exit,
+        )
+        self.trades[str(trade.id)] = trade
+        return trade
+
 
 def _walk_book(levels: list[PolymarketBookLevel], requested_shares: float) -> tuple[float, float]:
     remaining = requested_shares
@@ -304,6 +346,11 @@ def _walk_book(levels: list[PolymarketBookLevel], requested_shares: float) -> tu
         notional += level_fill * level.price
         remaining -= level_fill
     return filled, notional
+
+
+def _validate_entry_price(avg_entry_price: float) -> None:
+    if avg_entry_price <= 0 or avg_entry_price >= 1:
+        raise ValueError(f"invalid binary entry price: {avg_entry_price}")
 
 
 def _affordable_shares(

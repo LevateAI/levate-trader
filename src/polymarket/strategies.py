@@ -20,6 +20,9 @@ from src.polymarket.volatility import CoinbaseVolatilityTracker
 
 logger = structlog.get_logger(__name__)
 
+MIN_LATENCY_ENTRY_PRICE = 0.05
+MAX_LATENCY_ENTRY_PRICE = 0.95
+
 
 class PolymarketStrategy(Protocol):
     """Protocol for Polymarket snapshot strategies."""
@@ -217,9 +220,9 @@ class LatencyArbStrategy:
         yes_ask = context.yes_book.best_ask
         no_ask = context.no_book.best_ask
         candidates: list[tuple[PolymarketSide, float, float, PolymarketOrderBook]] = []
-        if yes_ask is not None:
+        if yes_ask is not None and _is_latency_price_tradable(yes_ask):
             candidates.append((PolymarketSide.YES, fair_yes - yes_ask, yes_ask, context.yes_book))
-        if no_ask is not None:
+        if no_ask is not None and _is_latency_price_tradable(no_ask):
             candidates.append((PolymarketSide.NO, (1.0 - fair_yes) - no_ask, no_ask, context.no_book))
         if not candidates:
             return None
@@ -357,6 +360,13 @@ def _shares_for_notional(
 
 def _fee_per_share(price: float, fee_rate: float) -> float:
     return fee_for_trade(1.0, price, fee_rate)
+
+
+def _is_latency_price_tradable(price: float | None) -> bool:
+    return (
+        price is not None
+        and MIN_LATENCY_ENTRY_PRICE <= price <= MAX_LATENCY_ENTRY_PRICE
+    )
 
 
 STRATEGY_REGISTRY: dict[str, type[MultiOutcomeSumArbitrageStrategy] | type[LatencyArbStrategy]] = {

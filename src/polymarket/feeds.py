@@ -929,7 +929,7 @@ def _levels(payload: Any, *, descending: bool) -> list[PolymarketBookLevel]:
             size = float(item["size"])
         except (KeyError, TypeError, ValueError):
             continue
-        if 0 <= price <= 1 and size > 0:
+        if 0 < price < 1 and size > 0:
             levels.append(PolymarketBookLevel(price=price, size=size))
     return sorted(levels, key=lambda level: level.price, reverse=descending)
 
@@ -937,10 +937,10 @@ def _levels(payload: Any, *, descending: bool) -> list[PolymarketBookLevel]:
 def _price_from_payload(payload: Any) -> float | None:
     if isinstance(payload, int | float):
         price = float(payload)
-        return price if 0 <= price <= 1 else None
+        return price if 0 < price < 1 else None
     if isinstance(payload, str):
         price = float(payload)
-        return price if 0 <= price <= 1 else None
+        return price if 0 < price < 1 else None
     if not isinstance(payload, dict):
         return None
     for key in ("price", "bestPrice", "value"):
@@ -948,7 +948,7 @@ def _price_from_payload(payload: Any) -> float | None:
         if raw_value is None:
             continue
         price = float(raw_value)
-        return price if 0 <= price <= 1 else None
+        return price if 0 < price < 1 else None
     return None
 
 

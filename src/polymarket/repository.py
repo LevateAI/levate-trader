@@ -80,8 +80,19 @@ class PolymarketRepository:
         )
 
     async def insert_trade(self, trade: PolymarketTrade) -> None:
-        """Insert a paper trade row."""
-        await self._insert("polymarket_trades", trade.to_payload())
+        """Insert or update a paper trade row."""
+        payload: Any = trade.to_payload()
+        logger.info(
+            "polymarket_trade_upsert",
+            account_id=payload.get("account_id"),
+            market_id=payload.get("market_id"),
+            status=payload.get("status"),
+        )
+        await asyncio.to_thread(
+            lambda: self._client.table("polymarket_trades")
+            .upsert(payload, on_conflict="id")
+            .execute()
+        )
 
     async def insert_equity_snapshot(
         self,

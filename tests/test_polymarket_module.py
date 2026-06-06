@@ -368,6 +368,19 @@ def test_price_to_beat_from_next_data_uses_crypto_prices_open_price() -> None:
     )
 
 
+def test_zero_and_terminal_book_prices_are_rejected() -> None:
+    levels = _levels(
+        [
+            {"price": "0", "size": "100000"},
+            {"price": "0.5", "size": "10"},
+            {"price": "1", "size": "100000"},
+        ],
+        descending=False,
+    )
+
+    assert [(level.price, level.size) for level in levels] == [(0.5, 10.0)]
+
+
 def test_polymarket_account_ids_are_coin_by_horizon_books() -> None:
     runtime = object.__new__(PolymarketRuntime)
     runtime.settings = SimpleNamespace(polymarket_horizon="15m")
@@ -543,7 +556,7 @@ async def test_paper_buying_shares_respects_book_depth() -> None:
 @pytest.mark.asyncio
 async def test_yes_resolution_pnl_is_share_payout_minus_entry_cost() -> None:
     executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
-    await executor.open_position(
+    open_trade = await executor.open_position(
         "market-1",
         PolymarketSide.YES,
         10,
@@ -554,13 +567,16 @@ async def test_yes_resolution_pnl_is_share_payout_minus_entry_cost() -> None:
 
     trade = await executor.settle_position("market-1", PolymarketSide.YES, PolymarketSide.YES)
 
+    assert trade.id == open_trade.id
+    assert trade.strategy_name == "test"
+    assert trade.status == "resolved"
     assert trade.pnl_usd == pytest.approx(10 * (1 - 0.62))
 
 
 @pytest.mark.asyncio
 async def test_no_resolution_pnl_is_negative_entry_cost_for_yes_position() -> None:
     executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
-    await executor.open_position(
+    open_trade = await executor.open_position(
         "market-1",
         PolymarketSide.YES,
         10,
@@ -571,7 +587,25 @@ async def test_no_resolution_pnl_is_negative_entry_cost_for_yes_position() -> No
 
     trade = await executor.settle_position("market-1", PolymarketSide.YES, PolymarketSide.NO)
 
+    assert trade.id == open_trade.id
+    assert trade.strategy_name == "test"
+    assert trade.status == "resolved"
     assert trade.pnl_usd == pytest.approx(-(0.62 * 10))
+
+
+@pytest.mark.asyncio
+async def test_paper_executor_rejects_zero_price_fill() -> None:
+    executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
+
+    with pytest.raises(ValueError, match="invalid binary entry price"):
+        await executor.open_position(
+            "market-1",
+            PolymarketSide.YES,
+            10,
+            _book(PolymarketSide.YES, asks=[(0.0, 10)]),
+            "test",
+            "zero price should not be tradable",
+        )
 
 
 @pytest.mark.asyncio
@@ -708,6 +742,28 @@ async def test_latency_arb_emits_signal_only_when_edge_exceeds_threshold() -> No
 
 
 @pytest.mark.asyncio
+async def test_latency_arb_rejects_extreme_tail_prices() -> None:
+    strategy = LatencyArbStrategy(edge_threshold=0.05, max_account_pct=0.05)
+    now = datetime.now(tz=UTC)
+    tracker = CoinbaseVolatilityTracker(window_sec=3600)
+    tracker.record_price("BTC", 104_900, now - timedelta(seconds=120))
+    tracker.record_price("BTC", 104_950, now - timedelta(seconds=60))
+    tracker.record_price("BTC", 105_000, now)
+    market = _market()
+    market.resolution_time = now + timedelta(hours=1)
+    context = _context(
+        market=market,
+        spot=105_000,
+        yes_book=_book(PolymarketSide.YES, asks=[(0.01, 1_000_000)]),
+        no_book=_book(PolymarketSide.NO, asks=[(0.99, 1_000_000)]),
+    )
+
+    signal = await strategy.on_context(context, 500, tracker, now=now)
+
+    assert signal is None
+
+
+@pytest.mark.asyncio
 async def test_polymarket_runtime_halts_strategies_when_feed_is_stale() -> None:
     runtime = object.__new__(PolymarketRuntime)
     runtime.settings = SimpleNamespace(polymarket_stale_threshold_sec=20)
@@ -829,6 +885,8 @@ async def test_runtime_settlement_writes_resolved_trade_and_position() -> None:
     settled = await runtime._settle_if_due(context)
 
     assert settled is True
+    assert repository.trades[-1].strategy_name == "test"
+    assert repository.trades[-1].status == "resolved"
     assert repository.trades[-1].pnl_usd == pytest.approx(10 * (1 - 0.62))
     assert repository.positions[-1].status == "resolved"
 
