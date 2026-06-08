@@ -18,6 +18,10 @@ from src.polymarket.feeds import (
     _market_payload_diagnostics,
     _price_to_beat_from_next_data,
 )
+from src.polymarket.ev_model import (
+    normal_digital_yes_probability,
+    student_t_digital_yes_probability,
+)
 from src.polymarket.main import PolymarketComponentStaleError, PolymarketRuntime
 from src.polymarket.models import (
     CoinbaseSpotPrice,
@@ -31,7 +35,12 @@ from src.polymarket.models import (
 )
 from src.polymarket.paper_executor import PolymarketPaperExecutor
 from src.polymarket.signals import PolymarketSignal, PolymarketSignalLeg
-from src.polymarket.strategies import LatencyArbStrategy, MultiOutcomeSumArbitrageStrategy
+from src.polymarket.strategies import (
+    EvGatedStrategy,
+    LatencyArbStrategy,
+    MultiOutcomeSumArbitrageStrategy,
+    evaluate_ev_entry_gate,
+)
 from src.polymarket.synchronizer import PolymarketDataSynchronizer
 from src.polymarket.volatility import CoinbaseVolatilityTracker
 
@@ -76,6 +85,8 @@ def _context(
     yes_book: PolymarketOrderBook | None = None,
     no_book: PolymarketOrderBook | None = None,
     spot: float = 101_000,
+    timestamp: datetime | None = None,
+    seconds_to_resolution: int = 300,
 ) -> PolymarketMarketContext:
     market = market or _market()
     yes_book = yes_book or _book(PolymarketSide.YES, asks=[(0.62, 100)])
@@ -96,8 +107,9 @@ def _context(
             resolution_time=market.resolution_time,
             horizon=market.horizon,
             window_seconds=market.window_seconds,
-            seconds_to_resolution=300,
-            timestamp=datetime.now(tz=UTC),
+            seconds_to_resolution=seconds_to_resolution,
+            price_to_beat=market.reference_price,
+            timestamp=timestamp or datetime.now(tz=UTC),
         ),
     )
 
@@ -687,6 +699,80 @@ async def test_paper_executor_never_stakes_more_than_balance() -> None:
 
 
 @pytest.mark.asyncio
+async def test_paper_executor_clamps_oversized_signal_to_strategy_cap_with_fees() -> None:
+    executor = PolymarketPaperExecutor(
+        "poly-test",
+        starting_balance_usd=500,
+        taker_fee_rate=0.072,
+        fees_enabled=True,
+    )
+    book = _book(PolymarketSide.YES, asks=[(0.19, 2_000_000)])
+    signal = PolymarketSignal(
+        strategy_name="ev_gated",
+        market_id="market-1",
+        horizon="5m",
+        window_seconds=300,
+        reason_entry="oversized ev signal",
+        risk_profile="test",
+        max_stake_usd=30,
+        legs=[
+            PolymarketSignalLeg(
+                side=PolymarketSide.YES,
+                shares=1_000_000,
+                order_book=book,
+                expected_avg_price=0.19,
+                p_model=0.85,
+                edge_at_entry=0.6,
+                entry_reason_code="cheap_side_ev",
+            )
+        ],
+    )
+
+    trades = await executor.execute_signal(signal)
+    gross_notional = trades[0].shares * trades[0].entry_price
+
+    assert len(trades) == 1
+    assert gross_notional + (trades[0].fee_paid or 0.0) <= 30.01
+    assert executor.balance_usd >= 469.99
+
+
+@pytest.mark.asyncio
+async def test_paper_executor_equity_reconciles_to_trade_ledger() -> None:
+    executor = PolymarketPaperExecutor("poly-test", starting_balance_usd=500, fees_enabled=False)
+    await executor.open_position(
+        "market-1",
+        PolymarketSide.YES,
+        10,
+        _book(PolymarketSide.YES, asks=[(0.5, 10)]),
+        "test",
+        "equity reconciliation test",
+    )
+    await executor.mark_to_market(
+        "market-1",
+        PolymarketSide.YES,
+        _book(PolymarketSide.YES, bids=[(0.65, 10)]),
+    )
+
+    expected_open_equity = (
+        executor.starting_balance_usd
+        + executor.realized_pnl_usd
+        + executor.open_mark_to_market_pnl_usd
+    )
+    assert executor.equity_usd == pytest.approx(expected_open_equity, abs=0.01)
+    assert executor.equity_usd == pytest.approx(501.5)
+
+    await executor.settle_position("market-1", PolymarketSide.YES, PolymarketSide.YES)
+
+    expected_settled_equity = (
+        executor.starting_balance_usd
+        + executor.realized_pnl_usd
+        + executor.open_mark_to_market_pnl_usd
+    )
+    assert executor.equity_usd == pytest.approx(expected_settled_equity, abs=0.01)
+    assert executor.equity_usd == pytest.approx(505.0)
+
+
+@pytest.mark.asyncio
 async def test_mark_to_market_updates_unrealized_pnl_from_bid_book() -> None:
     executor = PolymarketPaperExecutor("poly-test", fees_enabled=False)
     await executor.open_position(
@@ -808,6 +894,130 @@ def test_latency_fair_value_model_produces_sane_probability() -> None:
     assert 0.5 < probability <= 1.0
 
 
+def test_ev_digital_model_is_half_when_spot_equals_strike() -> None:
+    probability = student_t_digital_yes_probability(
+        spot_price=100_000,
+        price_to_beat=100_000,
+        seconds_to_resolution=300,
+        variance_rate=1e-8,
+        degrees_of_freedom=4,
+    )
+
+    assert probability == pytest.approx(0.5)
+
+
+def test_ev_digital_model_is_monotonic_in_spot() -> None:
+    kwargs = {
+        "price_to_beat": 100_000,
+        "seconds_to_resolution": 300,
+        "variance_rate": 1e-8,
+        "degrees_of_freedom": 4,
+    }
+
+    low = student_t_digital_yes_probability(spot_price=99_900, **kwargs)
+    mid = student_t_digital_yes_probability(spot_price=100_000, **kwargs)
+    high = student_t_digital_yes_probability(spot_price=100_100, **kwargs)
+
+    assert low < mid < high
+
+
+def test_ev_digital_model_uses_sqrt_tau_scaling() -> None:
+    short_tau = student_t_digital_yes_probability(
+        spot_price=101_000,
+        price_to_beat=100_000,
+        seconds_to_resolution=60,
+        variance_rate=1e-6,
+        degrees_of_freedom=4,
+    )
+    long_tau = student_t_digital_yes_probability(
+        spot_price=101_000,
+        price_to_beat=100_000,
+        seconds_to_resolution=600,
+        variance_rate=1e-6,
+        degrees_of_freedom=4,
+    )
+
+    assert short_tau > long_tau > 0.5
+
+
+def test_student_t_model_shrinks_extremes_vs_normal() -> None:
+    kwargs = {
+        "spot_price": 101_000,
+        "price_to_beat": 100_000,
+        "seconds_to_resolution": 60,
+        "variance_rate": 1e-6,
+    }
+
+    student_t_probability = student_t_digital_yes_probability(
+        **kwargs,
+        degrees_of_freedom=4,
+    )
+    normal_probability = normal_digital_yes_probability(**kwargs)
+
+    assert 0.5 < student_t_probability < normal_probability
+
+
+def test_ev_entry_gate_rejects_fee_peak_band() -> None:
+    candidate = evaluate_ev_entry_gate(
+        fair_yes_probability=0.9,
+        yes_book=_book(PolymarketSide.YES, bids=[(0.49, 100)], asks=[(0.5, 100)]),
+        no_book=_book(PolymarketSide.NO, bids=[(0.49, 100)], asks=[(0.5, 100)]),
+        fee_rate=0.072,
+        min_edge=0.04,
+        fee_band_low=0.45,
+        fee_band_high=0.55,
+    )
+
+    assert candidate is None
+
+
+def test_ev_entry_gate_rejects_when_net_ev_below_minimum() -> None:
+    candidate = evaluate_ev_entry_gate(
+        fair_yes_probability=0.3,
+        yes_book=_book(PolymarketSide.YES, bids=[(0.19, 100)], asks=[(0.2, 100)]),
+        no_book=_book(PolymarketSide.NO, bids=[(0.79, 100)], asks=[(0.8, 100)]),
+        fee_rate=0.072,
+        min_edge=0.2,
+        fee_band_low=0.45,
+        fee_band_high=0.55,
+    )
+
+    assert candidate is None
+
+
+def test_ev_entry_gate_accepts_clear_cheap_side_edge() -> None:
+    candidate = evaluate_ev_entry_gate(
+        fair_yes_probability=0.8,
+        yes_book=_book(PolymarketSide.YES, bids=[(0.19, 100)], asks=[(0.2, 100)]),
+        no_book=_book(PolymarketSide.NO, bids=[(0.79, 100)], asks=[(0.8, 100)]),
+        fee_rate=0.072,
+        min_edge=0.04,
+        fee_band_low=0.45,
+        fee_band_high=0.55,
+    )
+
+    assert candidate is not None
+    assert candidate.side == PolymarketSide.YES
+    assert candidate.entry_reason_code == "cheap_side_ev"
+    assert candidate.net_ev >= 0.04
+
+
+def test_ev_entry_gate_prefers_cheaper_side_when_both_qualify() -> None:
+    candidate = evaluate_ev_entry_gate(
+        fair_yes_probability=0.55,
+        yes_book=_book(PolymarketSide.YES, bids=[(0.19, 100)], asks=[(0.2, 100)]),
+        no_book=_book(PolymarketSide.NO, bids=[(0.24, 100)], asks=[(0.25, 100)]),
+        fee_rate=0.072,
+        min_edge=0.04,
+        fee_band_low=0.45,
+        fee_band_high=0.55,
+    )
+
+    assert candidate is not None
+    assert candidate.side == PolymarketSide.YES
+    assert candidate.ask_price == pytest.approx(0.2)
+
+
 @pytest.mark.asyncio
 async def test_latency_arb_emits_signal_only_when_edge_exceeds_threshold() -> None:
     strategy = LatencyArbStrategy(edge_threshold=0.05, max_account_pct=0.05)
@@ -892,6 +1102,92 @@ async def test_latency_arb_rejects_extreme_tail_prices() -> None:
     signal = await strategy.on_context(context, 500, tracker, now=now)
 
     assert signal is None
+
+
+@pytest.mark.asyncio
+async def test_ev_gated_strategy_can_emit_signal_from_dual_feed_context() -> None:
+    strategy = EvGatedStrategy(
+        min_edge=0.04,
+        stake_usd=30,
+        fee_rate=0.072,
+        vol_sample_sec=1,
+        cooldown_seconds=300,
+    )
+    tracker = CoinbaseVolatilityTracker()
+    now = datetime.now(tz=UTC)
+    seed_market = _market()
+    seed_market.reference_price = None
+    await strategy.on_context(
+        _context(market=seed_market, spot=100_000, timestamp=now - timedelta(seconds=4)),
+        account_equity=500,
+        volatility_tracker=tracker,
+        now=now - timedelta(seconds=4),
+    )
+    await strategy.on_context(
+        _context(market=seed_market, spot=100_050, timestamp=now - timedelta(seconds=2)),
+        account_equity=500,
+        volatility_tracker=tracker,
+        now=now - timedelta(seconds=2),
+    )
+    market = _market()
+    market.resolution_time = now + timedelta(minutes=5)
+    context = _context(
+        market=market,
+        spot=105_000,
+        yes_book=_book(PolymarketSide.YES, bids=[(0.19, 1_000)], asks=[(0.2, 1_000)]),
+        no_book=_book(PolymarketSide.NO, bids=[(0.79, 1_000)], asks=[(0.8, 1_000)]),
+        timestamp=now,
+    )
+
+    signal = await strategy.on_context(context, 500, tracker, now=now)
+
+    assert signal is not None
+    assert signal.strategy_name == "ev_gated"
+    assert signal.max_stake_usd == pytest.approx(30)
+    assert signal.legs[0].side == PolymarketSide.YES
+    assert signal.legs[0].p_model is not None
+    assert signal.legs[0].edge_at_entry is not None
+    assert signal.legs[0].entry_reason_code == "cheap_side_ev"
+
+
+@pytest.mark.asyncio
+async def test_ev_gated_trade_metadata_is_persisted_on_payload() -> None:
+    executor = PolymarketPaperExecutor(
+        "poly-test",
+        starting_balance_usd=500,
+        taker_fee_rate=0.072,
+        fees_enabled=True,
+    )
+    book = _book(PolymarketSide.YES, bids=[(0.19, 1_000)], asks=[(0.2, 1_000)])
+    signal = PolymarketSignal(
+        strategy_name="ev_gated",
+        market_id="market-1",
+        horizon="5m",
+        window_seconds=300,
+        reason_entry="EV gate accepted YES",
+        risk_profile="probabilistic_ev_gated_digital_model",
+        max_stake_usd=30,
+        legs=[
+            PolymarketSignalLeg(
+                side=PolymarketSide.YES,
+                shares=1_000,
+                order_book=book,
+                expected_avg_price=0.2,
+                p_model=0.82,
+                edge_at_entry=0.6,
+                entry_reason_code="cheap_side_ev",
+            )
+        ],
+    )
+
+    trades = await executor.execute_signal(signal)
+    payload = trades[0].to_payload()
+
+    assert payload["p_model"] == pytest.approx(0.82)
+    assert payload["edge_at_entry"] == pytest.approx(0.6)
+    assert payload["fee_paid"] is not None
+    assert payload["fee_paid"] > 0
+    assert payload["entry_reason_code"] == "cheap_side_ev"
 
 
 @pytest.mark.asyncio

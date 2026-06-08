@@ -16,6 +16,9 @@ class PolymarketSignalLeg:
     shares: float
     order_book: PolymarketOrderBook
     expected_avg_price: float
+    p_model: float | None = None
+    edge_at_entry: float | None = None
+    entry_reason_code: str | None = None
 
 
 @dataclass(slots=True)

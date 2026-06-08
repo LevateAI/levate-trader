@@ -23,6 +23,7 @@ from src.polymarket.repository import PolymarketRepository
 from src.polymarket.signals import PolymarketSignal
 from src.polymarket.strategies import (
     STRATEGY_REGISTRY,
+    EvGatedStrategy,
     LatencyArbStrategy,
     MultiOutcomeSumArbitrageStrategy,
     PolymarketStrategy,
@@ -478,6 +479,18 @@ class PolymarketRuntime:
                     edge_threshold=self.settings.polymarket_latency_edge_threshold,
                     max_account_pct=self.settings.polymarket_latency_max_account_pct,
                     max_stake_usd=self.settings.polymarket_latency_max_stake_usd,
+                    cooldown_seconds=self.settings.polymarket_strategy_cooldown_sec,
+                )
+            elif strategy_cls is EvGatedStrategy:
+                strategy = strategy_cls(
+                    min_edge=self.settings.polymarket_ev_min_edge,
+                    stake_usd=self.settings.polymarket_ev_stake_usd,
+                    fee_band_low=self.settings.polymarket_ev_fee_band_low,
+                    fee_band_high=self.settings.polymarket_ev_fee_band_high,
+                    fee_rate=self.settings.polymarket_fee_rate_crypto,
+                    vol_lambda=self.settings.polymarket_vol_lambda,
+                    vol_nu=self.settings.polymarket_vol_nu,
+                    vol_sample_sec=self.settings.polymarket_vol_sample_sec,
                     cooldown_seconds=self.settings.polymarket_strategy_cooldown_sec,
                 )
             else:

@@ -8,6 +8,10 @@ from typing import Any, Protocol
 
 import structlog
 
+from src.polymarket.ev_model import (
+    EwmaLogVarianceTracker,
+    student_t_digital_yes_probability,
+)
 from src.polymarket.models import (
     PolymarketBookLevel,
     PolymarketMarketContext,
@@ -46,6 +50,21 @@ class FillSimulation:
     shares: float
     notional: float
     avg_price: float
+
+
+@dataclass(slots=True)
+class EvCandidate:
+    """One eligible EV-gated entry candidate."""
+
+    side: PolymarketSide
+    p_model: float
+    ask_price: float
+    spread_half: float
+    fee_per_share: float
+    raw_edge: float
+    net_ev: float
+    order_book: PolymarketOrderBook
+    entry_reason_code: str
 
 
 class MultiOutcomeSumArbitrageStrategy:
@@ -297,6 +316,251 @@ class LatencyArbStrategy:
         return last_signal_at is not None and now - last_signal_at < self._cooldown
 
 
+class EvGatedStrategy:
+    """Buy only when a fee-adjusted digital-option model clears a hard EV gate."""
+
+    name = "ev_gated"
+
+    def __init__(
+        self,
+        min_edge: float = 0.04,
+        stake_usd: float = 30.0,
+        fee_band_low: float = 0.45,
+        fee_band_high: float = 0.55,
+        fee_rate: float = 0.072,
+        vol_lambda: float = 0.97,
+        vol_nu: float = 4.0,
+        vol_sample_sec: float = 2.0,
+        cooldown_seconds: int = 300,
+    ) -> None:
+        self._min_edge = min_edge
+        self._stake_usd = stake_usd
+        self._fee_band_low = fee_band_low
+        self._fee_band_high = fee_band_high
+        self._fee_rate = fee_rate
+        self._vol_nu = vol_nu
+        self._cooldown = timedelta(seconds=cooldown_seconds)
+        self._last_signal_at: dict[str, datetime] = {}
+        self._volatility = EwmaLogVarianceTracker(
+            lambda_=vol_lambda,
+            sample_interval_sec=vol_sample_sec,
+        )
+        self._vol_lambda = vol_lambda
+        self._vol_sample_sec = vol_sample_sec
+
+    async def on_context(
+        self,
+        context: PolymarketMarketContext,
+        account_equity: float,
+        volatility_tracker: CoinbaseVolatilityTracker,
+        now: datetime | None = None,
+    ) -> PolymarketSignal | None:
+        """Evaluate one short-horizon market through the EV entry gate."""
+        del volatility_tracker
+        current_time = now or datetime.now(tz=UTC)
+        self._volatility.record_price(
+            asset_symbol=context.market.asset_symbol,
+            price=context.snapshot.coinbase_ref_price,
+            timestamp=context.snapshot.timestamp,
+        )
+        if self._in_cooldown(context.market.market_id, current_time):
+            return None
+        price_to_beat = context.snapshot.price_to_beat
+        if price_to_beat is None or price_to_beat <= 0:
+            logger.info(
+                "polymarket_ev_gated_skipped_missing_strike",
+                market_id=context.market.market_id,
+                asset_symbol=context.market.asset_symbol,
+            )
+            return None
+        variance_rate = self._volatility.variance_rate(context.market.asset_symbol)
+        if variance_rate is None:
+            return None
+        seconds_to_resolution = max(float(context.snapshot.seconds_to_resolution), 0.0)
+        if seconds_to_resolution <= 0:
+            return None
+
+        fair_yes = student_t_digital_yes_probability(
+            spot_price=context.snapshot.coinbase_ref_price,
+            price_to_beat=price_to_beat,
+            seconds_to_resolution=seconds_to_resolution,
+            variance_rate=variance_rate,
+            degrees_of_freedom=self._vol_nu,
+        )
+        candidate = evaluate_ev_entry_gate(
+            fair_yes_probability=fair_yes,
+            yes_book=context.yes_book,
+            no_book=context.no_book,
+            fee_rate=self._fee_rate,
+            min_edge=self._min_edge,
+            fee_band_low=self._fee_band_low,
+            fee_band_high=self._fee_band_high,
+        )
+        if candidate is None:
+            return None
+
+        max_notional = min(max(account_equity, 0.0), self._stake_usd)
+        shares = _shares_for_notional(
+            candidate.order_book.asks,
+            max_notional,
+            self._fee_rate,
+        )
+        if shares <= 0:
+            return None
+        fill = _simulate_fill(candidate.order_book.asks, shares)
+        if fill is None:
+            return None
+
+        self._last_signal_at[context.market.market_id] = current_time
+        if candidate.entry_reason_code == "expensive_side_ev":
+            logger.info(
+                "polymarket_ev_gated_expensive_side_accepted",
+                market_id=context.market.market_id,
+                side=candidate.side.value,
+                p_model=candidate.p_model,
+                ask_price=candidate.ask_price,
+                net_ev=candidate.net_ev,
+            )
+        reason = (
+            f"EV gate accepted {candidate.side.value}: p_model={candidate.p_model:.4f}, "
+            f"ask={candidate.ask_price:.4f}, net_ev={candidate.net_ev:.4f}, "
+            f"strike={price_to_beat:.2f}, spot={context.snapshot.coinbase_ref_price:.2f}."
+        )
+        logger.info(
+            "polymarket_ev_gated_signal",
+            market_id=context.market.market_id,
+            asset_symbol=context.market.asset_symbol,
+            side=candidate.side.value,
+            p_model=candidate.p_model,
+            edge_at_entry=candidate.net_ev,
+            shares=fill.shares,
+            entry_reason_code=candidate.entry_reason_code,
+        )
+        return PolymarketSignal(
+            strategy_name=self.name,
+            market_id=context.market.market_id,
+            horizon=context.market.horizon,
+            window_seconds=context.market.window_seconds,
+            reason_entry=reason,
+            risk_profile="probabilistic_ev_gated_digital_model",
+            max_stake_usd=max_notional,
+            legs=[
+                PolymarketSignalLeg(
+                    side=candidate.side,
+                    shares=fill.shares,
+                    order_book=candidate.order_book,
+                    expected_avg_price=fill.avg_price,
+                    p_model=candidate.p_model,
+                    edge_at_entry=candidate.net_ev,
+                    entry_reason_code=candidate.entry_reason_code,
+                )
+            ],
+            features={
+                "fair_yes_probability": fair_yes,
+                "p_model": candidate.p_model,
+                "raw_edge": candidate.raw_edge,
+                "edge_at_entry": candidate.net_ev,
+                "fee_per_share": candidate.fee_per_share,
+                "spread_half": candidate.spread_half,
+                "ask_price": candidate.ask_price,
+                "price_to_beat": price_to_beat,
+                "coinbase_ref_price": context.snapshot.coinbase_ref_price,
+                "seconds_to_resolution": seconds_to_resolution,
+                "variance_rate": variance_rate,
+                "vol_lambda": self._vol_lambda,
+                "vol_nu": self._vol_nu,
+                "vol_sample_sec": self._vol_sample_sec,
+                "entry_reason_code": candidate.entry_reason_code,
+                "min_edge": self._min_edge,
+            },
+        )
+
+    def _in_cooldown(self, market_id: str, now: datetime) -> bool:
+        last_signal_at = self._last_signal_at.get(market_id)
+        return last_signal_at is not None and now - last_signal_at < self._cooldown
+
+
+def evaluate_ev_entry_gate(
+    *,
+    fair_yes_probability: float,
+    yes_book: PolymarketOrderBook,
+    no_book: PolymarketOrderBook,
+    fee_rate: float,
+    min_edge: float,
+    fee_band_low: float,
+    fee_band_high: float,
+) -> EvCandidate | None:
+    """Return the preferred EV candidate when the hard entry gate clears."""
+    candidates = [
+        _ev_candidate_for_side(
+            side=PolymarketSide.YES,
+            p_model=fair_yes_probability,
+            order_book=yes_book,
+            other_book=no_book,
+            fee_rate=fee_rate,
+            min_edge=min_edge,
+            fee_band_low=fee_band_low,
+            fee_band_high=fee_band_high,
+        ),
+        _ev_candidate_for_side(
+            side=PolymarketSide.NO,
+            p_model=1.0 - fair_yes_probability,
+            order_book=no_book,
+            other_book=yes_book,
+            fee_rate=fee_rate,
+            min_edge=min_edge,
+            fee_band_low=fee_band_low,
+            fee_band_high=fee_band_high,
+        ),
+    ]
+    eligible = [candidate for candidate in candidates if candidate is not None]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda candidate: (candidate.ask_price, -candidate.net_ev))
+
+
+def _ev_candidate_for_side(
+    *,
+    side: PolymarketSide,
+    p_model: float,
+    order_book: PolymarketOrderBook,
+    other_book: PolymarketOrderBook,
+    fee_rate: float,
+    min_edge: float,
+    fee_band_low: float,
+    fee_band_high: float,
+) -> EvCandidate | None:
+    ask_price = order_book.best_ask
+    bid_price = order_book.best_bid
+    if ask_price is None or bid_price is None:
+        return None
+    if fee_band_low <= ask_price <= fee_band_high:
+        return None
+    spread_half = max(ask_price - bid_price, 0.0) / 2.0
+    fee_per_share = _fee_per_share(ask_price, fee_rate)
+    raw_edge = p_model - ask_price
+    net_ev = raw_edge - fee_per_share - spread_half
+    if net_ev < min_edge:
+        return None
+    other_ask = other_book.best_ask
+    reason_code = (
+        "expensive_side_ev"
+        if other_ask is not None and ask_price > other_ask
+        else "cheap_side_ev"
+    )
+    return EvCandidate(
+        side=side,
+        p_model=p_model,
+        ask_price=ask_price,
+        spread_half=spread_half,
+        fee_per_share=fee_per_share,
+        raw_edge=raw_edge,
+        net_ev=net_ev,
+        order_book=order_book,
+        entry_reason_code=reason_code,
+    )
+
+
 def _simulate_fill(
     asks: list[PolymarketBookLevel],
     shares: float,
@@ -391,7 +655,11 @@ def _is_latency_price_tradable(price: float | None) -> bool:
     )
 
 
-STRATEGY_REGISTRY: dict[str, type[MultiOutcomeSumArbitrageStrategy] | type[LatencyArbStrategy]] = {
+STRATEGY_REGISTRY: dict[
+    str,
+    type[MultiOutcomeSumArbitrageStrategy] | type[LatencyArbStrategy] | type[EvGatedStrategy],
+] = {
     MultiOutcomeSumArbitrageStrategy.name: MultiOutcomeSumArbitrageStrategy,
     LatencyArbStrategy.name: LatencyArbStrategy,
+    EvGatedStrategy.name: EvGatedStrategy,
 }

@@ -34,6 +34,7 @@ class PolymarketPaperExecutor:
         default_max_stake_usd: float = 50.0,
     ) -> None:
         self.account_id = account_id
+        self.starting_balance_usd = _money(starting_balance_usd)
         self.balance_usd = _money(starting_balance_usd)
         self.taker_fee_rate = taker_fee_rate
         self.fees_enabled = fees_enabled
@@ -45,13 +46,40 @@ class PolymarketPaperExecutor:
 
     @property
     def equity_usd(self) -> float:
-        """Return current paper equity including marked open positions."""
-        open_value = sum(
-            position.current_price * position.shares
-            for position in self.positions.values()
-            if position.status == PolymarketPositionStatus.OPEN
+        """Return current paper equity reconciled to trade ledger PnL."""
+        return self.reconciled_equity_usd
+
+    @property
+    def realized_pnl_usd(self) -> float:
+        """Return realized PnL from closed and resolved trade rows."""
+        return _money(
+            sum(
+                trade.pnl_usd or 0.0
+                for trade in self.trades.values()
+                if trade.status
+                in {PolymarketTradeStatus.CLOSED, PolymarketTradeStatus.RESOLVED}
+            )
         )
-        return _money(self.balance_usd + open_value)
+
+    @property
+    def open_mark_to_market_pnl_usd(self) -> float:
+        """Return current open-position mark-to-market PnL."""
+        return _money(
+            sum(
+                position.unrealized_pnl
+                for position in self.positions.values()
+                if position.status == PolymarketPositionStatus.OPEN
+            )
+        )
+
+    @property
+    def reconciled_equity_usd(self) -> float:
+        """Return starting balance plus realized PnL plus open MTM PnL."""
+        return _money(
+            self.starting_balance_usd
+            + self.realized_pnl_usd
+            + self.open_mark_to_market_pnl_usd
+        )
 
     async def execute_signal(self, signal: PolymarketSignal) -> list[PolymarketTrade]:
         """Execute a strategy signal using the existing paper fill model."""
@@ -83,6 +111,9 @@ class PolymarketPaperExecutor:
                 horizon=signal.horizon,
                 window_seconds=signal.window_seconds,
                 max_stake_usd=remaining_stake_usd,
+                p_model=leg.p_model,
+                edge_at_entry=leg.edge_at_entry,
+                entry_reason_code=leg.entry_reason_code,
             )
             remaining_stake_usd = _money(
                 remaining_stake_usd - max(balance_before - self.balance_usd, 0.0)
@@ -101,6 +132,9 @@ class PolymarketPaperExecutor:
         horizon: str = "5m",
         window_seconds: int = 300,
         max_stake_usd: float | None = None,
+        p_model: float | None = None,
+        edge_at_entry: float | None = None,
+        entry_reason_code: str | None = None,
     ) -> PolymarketTrade:
         """Buy shares from the ask book, filling only available depth."""
         if requested_shares <= 0:
@@ -134,8 +168,13 @@ class PolymarketPaperExecutor:
             _validate_entry_price(avg_entry_price)
             fee = self._fee(filled_shares, avg_entry_price)
             total_cost = gross_cost + fee
+        if total_cost - available_usdc > 0.005:
+            raise ValueError("paper fill exceeded hard stake cap")
 
-        self.balance_usd = _money(self.balance_usd - total_cost)
+        new_balance = _money(self.balance_usd - total_cost)
+        if new_balance < -0.005:
+            raise ValueError("paper fill exceeded available account balance")
+        self.balance_usd = max(new_balance, 0.0)
         key = (market_id, side)
         existing = self.positions.get(key)
         if existing is None:
@@ -174,6 +213,10 @@ class PolymarketPaperExecutor:
             pnl_usd=None,
             status=PolymarketTradeStatus.OPEN,
             reason_entry=reason_entry,
+            p_model=p_model,
+            edge_at_entry=edge_at_entry,
+            fee_paid=fee,
+            entry_reason_code=entry_reason_code,
         )
         self.trades[str(trade.id)] = trade
         self._open_trade_ids_by_position.setdefault(key, []).append(str(trade.id))

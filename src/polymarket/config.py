@@ -26,14 +26,21 @@ class PolymarketSettings(BaseSettings):
     polymarket_stale_threshold_sec: int = 20
     polymarket_max_markets: int = 16
     polymarket_market_keywords: str = "bitcoin,btc,ethereum,eth,solana,sol,xrp,ripple"
-    polymarket_fee_rate_crypto: float = 0.07
-    polymarket_strategies_enabled: str = "multi_outcome_sum_arb,latency_arb"
+    polymarket_fee_rate_crypto: float = 0.072
+    polymarket_strategies_enabled: str = "multi_outcome_sum_arb,latency_arb,ev_gated"
     polymarket_sum_arb_threshold: float = 0.02
     polymarket_sum_arb_max_account_pct: float = 0.10
     polymarket_sum_arb_max_stake_usd: float = 50.0
     polymarket_latency_edge_threshold: float = 0.05
     polymarket_latency_max_account_pct: float = 0.05
     polymarket_latency_max_stake_usd: float = 25.0
+    polymarket_ev_min_edge: float = 0.04
+    polymarket_ev_stake_usd: float = 30.0
+    polymarket_ev_fee_band_low: float = 0.45
+    polymarket_ev_fee_band_high: float = 0.55
+    polymarket_vol_lambda: float = 0.97
+    polymarket_vol_nu: float = 4.0
+    polymarket_vol_sample_sec: float = 2.0
     polymarket_vol_window_sec: int = 900
     polymarket_strategy_cooldown_sec: int = 300
     stale_limit_seconds: int = 120
@@ -88,12 +95,32 @@ class PolymarketSettings(BaseSettings):
         "polymarket_latency_max_account_pct",
         "polymarket_sum_arb_max_stake_usd",
         "polymarket_latency_max_stake_usd",
+        "polymarket_ev_min_edge",
+        "polymarket_ev_stake_usd",
+        "polymarket_ev_fee_band_low",
+        "polymarket_ev_fee_band_high",
     )
     @classmethod
     def validate_strategy_fractions(cls, value: float) -> float:
         """Validate non-negative strategy fraction settings."""
         if value < 0:
             raise ValueError("Polymarket strategy fractions cannot be negative")
+        return value
+
+    @field_validator("polymarket_vol_nu", "polymarket_vol_sample_sec")
+    @classmethod
+    def validate_positive_strategy_numbers(cls, value: float) -> float:
+        """Validate positive EV model settings."""
+        if value <= 0:
+            raise ValueError("Polymarket EV model settings must be positive")
+        return value
+
+    @field_validator("polymarket_vol_lambda")
+    @classmethod
+    def validate_vol_lambda(cls, value: float) -> float:
+        """Validate EWMA lambda."""
+        if not 0 < value < 1:
+            raise ValueError("POLYMARKET_VOL_LAMBDA must be between 0 and 1")
         return value
 
     @property

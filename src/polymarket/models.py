@@ -222,6 +222,10 @@ class PolymarketTrade:
     status: PolymarketTradeStatus
     reason_entry: str
     reason_exit: str | None = None
+    p_model: float | None = None
+    edge_at_entry: float | None = None
+    fee_paid: float | None = None
+    entry_reason_code: str | None = None
 
     def to_payload(self) -> dict[str, object]:
         """Return a Supabase row payload."""
@@ -241,6 +245,12 @@ class PolymarketTrade:
             "status": self.status.value,
             "reason_entry": self.reason_entry,
             "reason_exit": self.reason_exit,
+            "p_model": round(self.p_model, 6) if self.p_model is not None else None,
+            "edge_at_entry": (
+                round(self.edge_at_entry, 6) if self.edge_at_entry is not None else None
+            ),
+            "fee_paid": round(self.fee_paid, 6) if self.fee_paid is not None else None,
+            "entry_reason_code": self.entry_reason_code,
         }
 
 

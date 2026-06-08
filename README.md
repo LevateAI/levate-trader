@@ -118,10 +118,10 @@ short-duration crypto markets. Defaults to
 `bitcoin,btc,ethereum,eth,solana,sol,xrp,ripple`.
 
 `POLYMARKET_FEE_RATE_CRYPTO`: Polymarket crypto taker fee coefficient used by
-the paper executor. Defaults to `0.07`.
+the paper executor and EV gate. Defaults to `0.072`.
 
 `POLYMARKET_STRATEGIES_ENABLED`: comma-separated Polymarket strategies. Defaults
-to `multi_outcome_sum_arb,latency_arb`.
+to `multi_outcome_sum_arb,latency_arb,ev_gated`.
 
 `POLYMARKET_SUM_ARB_THRESHOLD`: minimum guaranteed edge per YES+NO pair after
 fees for sum arbitrage. Defaults to `0.02`.
@@ -140,6 +140,24 @@ latency-arb leg. Defaults to `0.05`.
 
 `POLYMARKET_LATENCY_MAX_STAKE_USD`: hard dollar cap allocated to one latency-arb
 leg, regardless of inflated paper equity. Defaults to `25`.
+
+`POLYMARKET_EV_MIN_EDGE`: minimum fee-adjusted EV edge required for the
+`ev_gated` strategy. Defaults to `0.04`.
+
+`POLYMARKET_EV_STAKE_USD`: flat hard stake cap for one `ev_gated` entry.
+Defaults to `30`.
+
+`POLYMARKET_EV_FEE_BAND_LOW` and `POLYMARKET_EV_FEE_BAND_HIGH`: hard-ban
+probability prices in the fee-peak band. Defaults to `0.45` and `0.55`.
+
+`POLYMARKET_VOL_LAMBDA`: EWMA lambda for short-horizon EV volatility sampling.
+Defaults to `0.97`.
+
+`POLYMARKET_VOL_NU`: Student-t degrees of freedom used by the EV digital model.
+Defaults to `4`.
+
+`POLYMARKET_VOL_SAMPLE_SEC`: minimum spacing between Coinbase spot samples used
+by the EV volatility model. Defaults to `2`.
 
 `POLYMARKET_VOL_WINDOW_SEC`: rolling Coinbase spot window used for realized
 volatility. Defaults to `900`.
