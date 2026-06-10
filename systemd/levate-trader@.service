@@ -10,7 +10,7 @@ WorkingDirectory=/home/levateai/levate-trader
 EnvironmentFile=/home/levateai/levate-trader/envs/%i.env
 Environment=ACCOUNT_ID=%i
 ExecStart=/home/levateai/levate-trader/.venv/bin/python -m src.main
-Restart=always
+Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal

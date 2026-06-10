@@ -26,6 +26,12 @@ from src.strategies.scalp_common import SCALP_STRATEGY_NAMES
 
 logger = structlog.get_logger(__name__)
 STALE_LOG_THROTTLE_SEC = 30
+HIGH_WATER_STATE_KEY = "high_water_equity"
+HEARTBEAT_BASE_COMPONENTS: tuple[str, ...] = ("market", "strategy", "equity")
+
+
+class TraderComponentStaleError(RuntimeError):
+    """Raised when a perp runtime loop has stopped doing useful work."""
 
 
 class TraderRuntime:
@@ -63,12 +69,28 @@ class TraderRuntime:
         self._last_market_write_source_timestamp: dict[str, datetime] = {}
         self._throttled_log_at: dict[str, float] = {}
         self._http_calls_this_minute = 0
+        components = list(HEARTBEAT_BASE_COMPONENTS)
+        if self.settings.market_data_writer:
+            components.append("market_data")
+        self._heartbeat_components: tuple[str, ...] = tuple(components)
+        started_at_mono = time.monotonic()
+        started_at_wall = datetime.now(tz=UTC)
+        self._last_success: dict[str, float] = {
+            component: started_at_mono for component in self._heartbeat_components
+        }
+        self._last_success_wall: dict[str, datetime] = {
+            component: started_at_wall for component in self._heartbeat_components
+        }
+        self._heartbeat_detail: dict[str, dict[str, Any]] = {
+            component: {"state": "initializing"} for component in self._heartbeat_components
+        }
 
     async def run(self) -> None:
-        """Run until a shutdown signal is received."""
+        """Run until shutdown, failing loudly when any worker task dies."""
         logger.info("runtime_starting")
         await self.sms.start()
         await self.circuit_breakers.load_state()
+        await self._load_high_water_equity()
         if self.settings.execution_mode == "paper_sim":
             await self.executor.restore_state()
         await self.exchange.connect_ws()
@@ -85,6 +107,7 @@ class TraderRuntime:
             asyncio.create_task(self._market_snapshot_loop(), name="market-snapshot-loop"),
             asyncio.create_task(self._snapshot_loop(), name="snapshot-loop"),
             asyncio.create_task(self._market_data_prune_loop(), name="market-data-prune-loop"),
+            asyncio.create_task(self._runtime_watchdog_loop(), name="runtime-watchdog"),
             asyncio.create_task(
                 self.exchange.watchdog_loop(
                     stale_threshold_sec=self.settings.stale_threshold_sec,
@@ -93,16 +116,125 @@ class TraderRuntime:
                 name="hyperliquid-ws-watchdog",
             ),
         ]
-        await self.stop_event.wait()
-        logger.info("runtime_shutdown_started")
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await self._shutdown()
+        try:
+            await self._supervise_tasks(tasks)
+        finally:
+            logger.info("runtime_shutdown_started")
+            await self._cancel_tasks(tasks)
+            await self._shutdown()
 
     def request_shutdown(self) -> None:
         """Request graceful shutdown."""
         self.stop_event.set()
+
+    async def _supervise_tasks(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Wait for shutdown or fail loudly when any worker task exits."""
+        stop_task = asyncio.create_task(self.stop_event.wait(), name="runtime-stop-wait")
+        try:
+            done, _ = await asyncio.wait(
+                [*tasks, stop_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done and self.stop_event.is_set():
+                return
+            for task in done:
+                if task is stop_task:
+                    continue
+                task_name = task.get_name()
+                if task.cancelled():
+                    logger.critical("runtime_task_cancelled", task_name=task_name)
+                    raise RuntimeError(f"perp task cancelled unexpectedly: {task_name}")
+                exc = task.exception()
+                if exc is not None:
+                    logger.critical(
+                        "runtime_task_failed",
+                        task_name=task_name,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                    raise exc
+                logger.critical("runtime_task_exited", task_name=task_name)
+                raise RuntimeError(f"perp task exited unexpectedly: {task_name}")
+        finally:
+            stop_task.cancel()
+            try:
+                await stop_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _cancel_tasks(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Cancel worker tasks during shutdown without hiding live failures."""
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error(
+                    "runtime_task_cleanup_error",
+                    task_name=task.get_name(),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+
+    async def _runtime_watchdog_loop(self) -> None:
+        """Upsert loop heartbeats and exit the process when a loop goes stale."""
+        while True:
+            await asyncio.sleep(self.settings.watchdog_interval_seconds)
+            try:
+                await self._watchdog_check_once()
+            except TraderComponentStaleError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "runtime_watchdog_loop_error",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+
+    async def _watchdog_check_once(self) -> None:
+        now_mono = time.monotonic()
+        stale_component: str | None = None
+        stale_age = 0.0
+        for component in self._heartbeat_components:
+            age_sec = now_mono - self._last_success[component]
+            detail = {
+                **self._heartbeat_detail.get(component, {}),
+                "age_sec": round(age_sec, 2),
+                "stale_limit_seconds": self.settings.stale_limit_seconds,
+            }
+            await self.repository.upsert_heartbeat(
+                component=component,
+                last_ok_at=self._last_success_wall[component],
+                detail=detail,
+            )
+            if age_sec > self.settings.stale_limit_seconds and stale_component is None:
+                stale_component = component
+                stale_age = age_sec
+        if stale_component is not None:
+            logger.critical(
+                "perp_component_stale",
+                component=stale_component,
+                age_sec=round(stale_age, 2),
+                stale_limit_seconds=self.settings.stale_limit_seconds,
+                account_id=self.settings.account_id,
+            )
+            error = TraderComponentStaleError(
+                f"perp component stale: {stale_component} age={stale_age:.2f}s"
+            )
+            self._safe_send_sms_error(error)
+            raise error
+
+    def _mark_success(self, component: str, detail: dict[str, Any] | None = None) -> None:
+        """Record that one runtime loop provably completed an iteration."""
+        last_success = getattr(self, "_last_success", None)
+        if last_success is None or component not in last_success:
+            return
+        last_success[component] = time.monotonic()
+        self._last_success_wall[component] = datetime.now(tz=UTC)
+        self._heartbeat_detail[component] = detail or {}
 
     async def _market_loop(self, strategies: list[Strategy]) -> None:
         while True:
@@ -111,6 +243,7 @@ class TraderRuntime:
                 event = await self.exchange.market_events.get()
                 if event["channel"] == "user_fills":
                     logger.info("fill_event_received", payload=event["payload"])
+                    self._mark_success("market", detail={"event": "user_fills"})
                     continue
                 symbol = event.get("symbol")
                 if symbol not in {BTC_PERP, ETH_PERP}:
@@ -118,6 +251,7 @@ class TraderRuntime:
                 market_state = self._ingest_market_event(symbol, event)
                 if self.settings.execution_mode == "paper_sim":
                     await self.executor.update_market_state(market_state)
+                self._mark_success("market", detail={"symbol": symbol})
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("market_loop_error", error=str(exc), error_type=type(exc).__name__)
                 self._safe_send_sms_error(exc)
@@ -141,6 +275,7 @@ class TraderRuntime:
                         await self.executor.update_market_state(market_state)
                     await self._run_strategies_for_symbol(symbol, market_state, strategies)
                     self._pending_trade_events[symbol] = []
+                self._mark_success("strategy", detail={"symbols": symbols})
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("strategy_loop_error", error=str(exc), error_type=type(exc).__name__)
                 self._safe_send_sms_error(exc)
@@ -150,8 +285,13 @@ class TraderRuntime:
         while True:
             try:
                 if self.settings.market_data_writer:
-                    for market_state in list(self._market_cache().values()):
+                    market_states = list(self._market_cache().values())
+                    for market_state in market_states:
                         await self._write_market_snapshot(market_state)
+                    self._mark_success(
+                        "market_data",
+                        detail={"snapshot_count": len(market_states)},
+                    )
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error(
                     "market_snapshot_loop_error",
@@ -211,6 +351,7 @@ class TraderRuntime:
         while True:
             try:
                 if not self._all_prices_fresh():
+                    self._mark_success("equity", detail={"skipped": "stale_prices"})
                     await asyncio.sleep(60)
                     continue
                 snapshot = await self._build_equity_snapshot()
@@ -224,6 +365,14 @@ class TraderRuntime:
                         await self.executor.close_all_positions("paper circuit breaker")
                     else:
                         await self.exchange.close_all_positions()
+                self._mark_success(
+                    "equity",
+                    detail={
+                        "equity_usd": snapshot.equity_usd,
+                        "mdd_pct": round(snapshot.mdd_pct, 6),
+                        "high_water_equity": self.high_water_equity,
+                    },
+                )
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 logger.error("snapshot_loop_error", error=str(exc), error_type=type(exc).__name__)
                 self._safe_send_sms_error(exc)
@@ -390,12 +539,64 @@ class TraderRuntime:
         await self.repository.insert("market_data_snapshots", payload)
         self._last_market_write_source_timestamp[market_state.symbol] = market_state.timestamp
 
+    async def _load_high_water_equity(self) -> None:
+        """Rebuild the all-time equity peak so the drawdown breaker survives restarts."""
+        high_water = self.settings.starting_balance_usd
+        state = await self.repository.get_state(HIGH_WATER_STATE_KEY)
+        if state is not None:
+            raw_value = state.get("value")
+            if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+                high_water = max(high_water, float(raw_value))
+        rows = await self.repository.select_where(
+            "equity_snapshots",
+            filters={"execution_mode": self.settings.execution_mode},
+            limit=1,
+            order_column="equity_usd",
+            desc=True,
+        )
+        if rows:
+            raw_equity = rows[0].get("equity_usd")
+            if raw_equity is not None:
+                try:
+                    high_water = max(high_water, float(raw_equity))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "high_water_snapshot_value_invalid",
+                        raw_equity=raw_equity,
+                    )
+        self.high_water_equity = high_water
+        logger.info(
+            "high_water_equity_loaded",
+            high_water_equity=high_water,
+            account_id=self.settings.account_id,
+            execution_mode=self.settings.execution_mode,
+        )
+
+    async def _update_high_water_equity(self, equity: float) -> None:
+        """Track and persist a new all-time equity peak."""
+        if equity <= self.high_water_equity:
+            return
+        self.high_water_equity = equity
+        await self.repository.upsert_state(
+            HIGH_WATER_STATE_KEY,
+            {
+                "value": round(equity, 2),
+                "execution_mode": self.settings.execution_mode,
+                "updated_at": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+        logger.info(
+            "high_water_equity_updated",
+            high_water_equity=self.high_water_equity,
+            account_id=self.settings.account_id,
+        )
+
     async def _build_equity_snapshot(self) -> EquitySnapshot:
         if self.settings.execution_mode == "paper_sim":
             equity = self.executor.paper_equity_usd
             daily_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=1))
             weekly_pnl = await self._pnl_since(equity, datetime.now(tz=UTC) - timedelta(days=7))
-            self.high_water_equity = max(self.high_water_equity, equity)
+            await self._update_high_water_equity(equity)
             mdd = (
                 (self.high_water_equity - equity) / self.high_water_equity
                 if self.high_water_equity > 0
@@ -420,7 +621,7 @@ class TraderRuntime:
         margin_used = float(margin_summary.get("totalMarginUsed") or 0)
         withdrawable = float(account_state.get("withdrawable") or equity)
         positions = await self.exchange.get_open_positions()
-        self.high_water_equity = max(self.high_water_equity, equity)
+        await self._update_high_water_equity(equity)
         mdd = (
             (self.high_water_equity - equity) / self.high_water_equity
             if self.high_water_equity > 0

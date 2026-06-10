@@ -24,6 +24,7 @@ logger = structlog.get_logger(__name__)
 TAKER_FEE_RATE = 0.00045
 MAKER_FEE_RATE = 0.00015
 MAX_FILL_SPREAD_PCT = 0.05
+PENDING_ORDERS_STATE_KEY = "paper_pending_orders"
 
 
 @dataclass(slots=True)
@@ -177,13 +178,79 @@ class PaperExecutor:
                 _money(self._settings.starting_balance_usd - restored_entry_fees),
             )
 
+        await self._restore_pending_orders()
+
         logger.info(
             "paper_state_restored",
             restored_count=restored_count,
             open_trade_count=len(open_trade_rows),
+            pending_order_count=len(self.pending_orders),
             paper_balance_usd=self.paper_balance_usd,
             execution_mode=self._settings.execution_mode,
         )
+
+    async def _restore_pending_orders(self) -> None:
+        """Reload resting paper limit orders persisted before the restart."""
+        if self._repository is None:
+            return
+        raw_state = await self._repository.get_state(PENDING_ORDERS_STATE_KEY)
+        if not raw_state:
+            return
+        restored: dict[int, PendingPaperOrder] = {}
+        dropped_count = 0
+        raw_orders = raw_state.get("orders")
+        for raw_order in raw_orders if isinstance(raw_orders, list) else []:
+            order = _pending_order_from_payload(raw_order)
+            if order is None:
+                dropped_count += 1
+                continue
+            if order.symbol in self.open_positions:
+                # A fill for this symbol landed before the restart; restoring
+                # the entry order would double up the position on next cross.
+                logger.warning(
+                    "paper_pending_order_dropped_existing_position",
+                    oid=order.oid,
+                    symbol=order.symbol,
+                )
+                dropped_count += 1
+                continue
+            restored[order.oid] = order
+        self.pending_orders.update(restored)
+        next_oid_candidates = [self._next_oid, max(restored, default=0) + 1]
+        raw_next_oid = raw_state.get("next_oid")
+        if isinstance(raw_next_oid, int) and not isinstance(raw_next_oid, bool):
+            next_oid_candidates.append(raw_next_oid)
+        self._next_oid = max(next_oid_candidates)
+        if dropped_count:
+            await self._persist_pending_orders()
+        logger.info(
+            "paper_pending_orders_restored",
+            restored_count=len(restored),
+            dropped_count=dropped_count,
+            next_oid=self._next_oid,
+        )
+
+    async def _persist_pending_orders(self) -> None:
+        """Persist the resting limit-order book so restarts cannot lose it."""
+        if self._repository is None:
+            return
+        payload = {
+            "next_oid": self._next_oid,
+            "orders": [
+                _pending_order_payload(order) for order in self.pending_orders.values()
+            ],
+        }
+        try:
+            await self._repository.upsert_state(PENDING_ORDERS_STATE_KEY, payload)
+        except Exception as exc:
+            # In-memory state stays authoritative; losing one persistence write
+            # only degrades restart recovery, so log loudly and keep trading.
+            logger.error(
+                "paper_pending_orders_persist_failed",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                pending_count=len(self.pending_orders),
+            )
 
     async def execute_signal(
         self,
@@ -290,6 +357,7 @@ class PaperExecutor:
         )
         self.pending_orders[oid] = order
         logger.info("paper_limit_order_pending", oid=oid, symbol=symbol, side=side.value, price=price)
+        await self._persist_pending_orders()
         await self._check_pending_order(order, self._latest_market.get(symbol))
         return {"status": "pending", "oid": oid}
 
@@ -551,6 +619,7 @@ class PaperExecutor:
             fee_rate=MAKER_FEE_RATE,
             signal=order.signal,
         )
+        await self._persist_pending_orders()
         logger.info("paper_limit_order_filled", oid=order.oid, trade_id=str(trade.id))
 
     async def _check_position_exit(
@@ -765,6 +834,98 @@ class PaperExecutor:
 
 def _money(value: float) -> float:
     return round(float(value), 2)
+
+
+def _pending_order_payload(order: PendingPaperOrder) -> dict[str, Any]:
+    return {
+        "oid": order.oid,
+        "symbol": order.symbol,
+        "side": order.side.value,
+        "size": order.size,
+        "price": order.price,
+        "created_at": order.created_at.isoformat(),
+        "signal": _signal_payload(order.signal),
+    }
+
+
+def _signal_payload(signal: Signal | None) -> dict[str, Any] | None:
+    if signal is None:
+        return None
+    return {
+        "side": signal.side.value,
+        "symbol": signal.symbol,
+        "size_pct_equity": signal.size_pct_equity,
+        "entry_price": signal.entry_price,
+        "stop_loss": signal.stop_loss,
+        "take_profit": signal.take_profit,
+        "reasoning": signal.reasoning,
+        "strategy_name": signal.strategy_name,
+        "signal_strength": signal.signal_strength,
+        "confidence": signal.confidence,
+        "reduce_only": signal.reduce_only,
+        "features": signal.features,
+        "created_at": signal.created_at.isoformat(),
+    }
+
+
+def _pending_order_from_payload(raw: Any) -> PendingPaperOrder | None:
+    if not isinstance(raw, dict):
+        return None
+    raw_signal = raw.get("signal")
+    signal: Signal | None = None
+    if raw_signal is not None:
+        signal = _signal_from_payload(raw_signal)
+        if signal is None:
+            # An order whose stop/take-profit context cannot be rebuilt would
+            # open an unprotected position on fill; drop it instead.
+            logger.warning("paper_pending_order_signal_unrecoverable", oid=raw.get("oid"))
+            return None
+    try:
+        return PendingPaperOrder(
+            oid=int(raw["oid"]),
+            symbol=str(raw["symbol"]),
+            side=Side(str(raw["side"])),
+            size=float(raw["size"]),
+            price=float(raw["price"]),
+            signal=signal,
+            created_at=_coerce_datetime(raw.get("created_at")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            "paper_pending_order_row_invalid",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        return None
+
+
+def _signal_from_payload(raw: Any) -> Signal | None:
+    if not isinstance(raw, dict):
+        return None
+    try:
+        take_profit = raw.get("take_profit")
+        return Signal(
+            side=Side(str(raw["side"])),
+            symbol=str(raw["symbol"]),
+            size_pct_equity=float(raw["size_pct_equity"]),
+            entry_price=float(raw["entry_price"]),
+            stop_loss=float(raw["stop_loss"]),
+            take_profit=float(take_profit) if take_profit is not None else None,
+            reasoning=str(raw.get("reasoning") or ""),
+            strategy_name=str(raw["strategy_name"]),
+            signal_strength=float(raw.get("signal_strength") or 1.0),
+            confidence=float(raw.get("confidence") or 0.5),
+            reduce_only=bool(raw.get("reduce_only", False)),
+            features=dict(raw.get("features") or {}),
+            created_at=_coerce_datetime(raw.get("created_at")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            "paper_pending_signal_invalid",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        return None
 
 
 def _gross_pnl(side: Side, entry_price: float, exit_price: float, size: float) -> float:

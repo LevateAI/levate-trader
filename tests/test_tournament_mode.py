@@ -19,10 +19,17 @@ from src.strategies.chaos_wrapper import ChaosStrategyWrapper
 @dataclass
 class MiniRepository:
     rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    state: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     async def insert(self, table: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.rows.setdefault(table, []).append(payload)
         return payload
+
+    async def get_state(self, key: str) -> dict[str, Any] | None:
+        return self.state.get(key)
+
+    async def upsert_state(self, key: str, value: dict[str, Any]) -> None:
+        self.state[key] = value
 
     async def update(self, table: str, row_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return payload | {"id": row_id}

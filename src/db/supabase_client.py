@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -162,6 +163,30 @@ class SupabaseRepository:
         if not response.data:
             return None
         return dict(response.data[0]["value"])
+
+    async def upsert_heartbeat(
+        self,
+        component: str,
+        last_ok_at: datetime,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Upsert one component liveness row into the shared heartbeat table."""
+        payload: dict[str, Any] = {
+            "account_id": self._account_id,
+            "component": component,
+            "last_ok_at": last_ok_at.isoformat(),
+            "detail": detail or {},
+        }
+        logger.info(
+            "supabase_heartbeat_upsert",
+            component=component,
+            account_id=self._account_id,
+        )
+        await asyncio.to_thread(
+            lambda: self._client.table("bot_heartbeat")
+            .upsert(payload, on_conflict="account_id,component")
+            .execute()
+        )
 
     async def delete_older_than(self, table: str, column: str, cutoff_iso: str) -> int:
         """Delete rows older than a cutoff and return the reported deletion count."""

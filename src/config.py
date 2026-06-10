@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     scalp_max_hold_minutes: int = 15
     scalp_cooldown_seconds: int = 600
     stale_threshold_sec: int = 20
+    stale_limit_seconds: int = 180
+    watchdog_interval_seconds: int = 15
     chaos_mode: bool = False
     market_data_writer: bool = True
     close_positions_on_shutdown: bool = False
@@ -88,7 +90,13 @@ class Settings(BaseSettings):
             raise ValueError("risk and leverage values must be positive")
         return value
 
-    @field_validator("scalp_max_hold_minutes", "scalp_cooldown_seconds", "stale_threshold_sec")
+    @field_validator(
+        "scalp_max_hold_minutes",
+        "scalp_cooldown_seconds",
+        "stale_threshold_sec",
+        "stale_limit_seconds",
+        "watchdog_interval_seconds",
+    )
     @classmethod
     def validate_scalp_positive_ints(cls, value: int) -> int:
         """Validate positive runtime limits."""

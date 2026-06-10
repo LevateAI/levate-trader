@@ -84,6 +84,13 @@ Defaults to `true`.
 `STALE_THRESHOLD_SEC`: max allowed age for websocket-derived prices before the
 bot reconnects, halts trading, and skips stale market writes. Defaults to `20`.
 
+`STALE_LIMIT_SECONDS`: max seconds a perp runtime loop (market, strategy,
+equity, market_data) may go without a proven successful iteration before the
+process exits non-zero for a systemd restart. Defaults to `180`.
+
+`WATCHDOG_INTERVAL_SECONDS`: how often perp loop heartbeats are upserted to
+`bot_heartbeat` and checked for staleness. Defaults to `15`.
+
 `CHAOS_MODE`: when `true`, wraps enabled strategies with randomized signal
 skipping and sizing for the `chaos` tournament account.
 
@@ -184,6 +191,9 @@ the bot:
 2. `supabase/migrations/002_add_execution_mode.sql`
 3. `supabase/migrations/003_tournament_mode.sql`
 4. `supabase/migrations/20260601145523_polymarket_part1.sql`
+5. `supabase/migrations/20260604222946_polymarket_stage0_price_to_beat.sql`
+6. `supabase/migrations/20260607203954_polymarket_ev_gated_trade_metadata.sql`
+7. `supabase/migrations/20260610090000_bot_heartbeat_table.sql`
 
 ## Tournament Mode
 
@@ -322,7 +332,26 @@ Circuit breakers:
 - Weekly loss `>= 10%`: flat-all action is logged and new entries pause for 24 hours.
 - All-time drawdown `>= 20%`: flat-all action is logged and entries pause until manual reset.
 
-Breaker state persists in Supabase `bot_state`.
+Breaker state persists in Supabase `bot_state`. The all-time equity peak used
+by the drawdown breaker also persists (`bot_state` key `high_water_equity`)
+and is rebuilt on startup from the account's equity-snapshot history, so the
+20% breaker measures drawdown from the true all-time peak across restarts.
+Pending paper limit orders persist in `bot_state` (`paper_pending_orders`)
+and are restored on restart; restored orders whose symbol already has an open
+position are dropped and logged.
+
+Runtime liveness is work-gated like the Polymarket module: each perp loop
+stamps a heartbeat only after a proven successful iteration, heartbeats are
+upserted to `bot_heartbeat` per account and component, and a watchdog exits
+the process non-zero (systemd `Restart=on-failure` restarts it) when any loop
+goes stale past `STALE_LIMIT_SECONDS`.
+
+For a read-only per-strategy expectancy report from closed trades:
+
+```bash
+python scripts/strategy_expectancy.py --days 30
+python scripts/strategy_expectancy.py --by-account
+```
 
 ## Tests
 

@@ -20,6 +20,13 @@ class DummyRepository:
     updates: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     deletes: list[tuple[str, str]] = field(default_factory=list)
     rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    state: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    async def get_state(self, key: str) -> dict[str, Any] | None:
+        return self.state.get(key)
+
+    async def upsert_state(self, key: str, value: dict[str, Any]) -> None:
+        self.state[key] = value
 
     async def insert(self, table: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.inserts.setdefault(table, []).append(payload)
